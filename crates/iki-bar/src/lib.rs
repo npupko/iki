@@ -4,6 +4,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
@@ -11,8 +12,8 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBackingStoreType,
     NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSGraphicsContext, NSLineCapStyle, NSPanel, NSResponder, NSScreen, NSShadow,
-    NSStatusWindowLevel, NSStringDrawing, NSView, NSWindow, NSWindowAnimationBehavior,
+    NSPanel, NSResponder, NSScreen, NSStatusWindowLevel, NSStringDrawing, NSView, NSWindow,
+    NSWindowAnimationBehavior,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -20,38 +21,31 @@ use objc2_foundation::{
     NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 
-/// Window is larger than the pill so the shadow is not clipped.
-/// The capsule itself is 92×36, close to the dictation bubble.
-const WINDOW_W: f64 = 124.0;
-const WINDOW_H: f64 = 68.0;
-const WINDOW_W_MAX: f64 = 360.0;
-const INSET: f64 = 16.0;
-const TEXT_PAD: f64 = 16.0;
+/// Bottom-dock hold-to-talk pill. Recording is 73×30, processing grows to 98×30.
+/// The hidden resting sliver is 40×8; the open transition starts there.
+const PILL_H: f64 = 30.0;
+const WIDTH_RECORDING: f64 = 73.0;
+const WIDTH_PROCESSING: f64 = 98.0;
+const REST_W: f64 = 40.0;
+const REST_H: f64 = 8.0;
+const WIDTH_MAX: f64 = 420.0;
+const TEXT_PAD: f64 = 12.0;
 const FONT_SIZE: f64 = 13.0;
 const MARGIN: f64 = 8.0;
 const FRAME_DT: f64 = 1.0 / 60.0;
+/// `transition: all .1s cubic-bezier(0.05, 0.6, 0.4, 0.95)`.
+const MORPH_SECS: f64 = 0.1;
 
-/// Delay in seconds, then height share. Ten bars, delays of 0.1s mirrored
-/// around the center.
-const BARS: [(f64, f64); 10] = [
-    (0.0, 0.578),
-    (0.1, 0.745),
-    (0.2, 0.870),
-    (0.3, 0.953),
-    (0.4, 0.995),
-    (-0.5, 0.995),
-    (-0.4, 0.953),
-    (-0.3, 0.870),
-    (-0.2, 0.745),
-    (-0.1, 0.578),
-];
+const BAR_COUNT: usize = 10;
 const BAR_W: f64 = 2.0;
 const BAR_GAP: f64 = 2.0;
-const BAR_MIN: f64 = 4.0;
-const BAR_MAX: f64 = 26.0;
-/// This MacBook mic's speech peaks around 0.05. Room tone sits near 0.01.
-const LEVEL_FLOOR: f64 = 0.01;
-const LEVEL_FULL: f64 = 0.055;
+const BAR_BASE: f64 = 2.0;
+const WAVE_PAD_X: f64 = 4.0;
+const CLUSTER_GAP: f64 = 6.0;
+const SPINNER_BOX: f64 = 16.0;
+const SPINNER_RADIUS: f64 = 6.0;
+/// `animation-delay: 0.1 * m[i]` for the ten-bar waveform.
+const BAR_DELAYS: [f64; BAR_COUNT] = [0.0, 0.1, 0.2, 0.3, 0.4, -0.5, -0.4, -0.3, -0.2, -0.1];
 
 #[derive(Clone, Debug)]
 pub enum BarPhase {
@@ -96,14 +90,26 @@ struct Drag {
 
 struct ViewIvars {
     slot: Arc<Mutex<BarPhase>>,
-    level: Cell<f32>,
     mode: Cell<Mode>,
     raw_message: RefCell<String>,
     fitted: RefCell<String>,
-    anim_t: Cell<f64>,
+    anim_origin: Cell<Option<Instant>>,
+    last_tick: Cell<Option<Instant>>,
     shown: Cell<bool>,
     drag: Cell<Option<Drag>>,
     timer: OnceCell<Retained<NSTimer>>,
+    /// Adaptive dBFS floor. Starts at 0 so the first real sample sets it.
+    floor_db: Cell<f64>,
+    /// Smoothed 0..=1 voice amount, before the ×5 audio scale.
+    voice: Cell<f64>,
+    cur_w: Cell<f64>,
+    cur_h: Cell<f64>,
+    from_w: Cell<f64>,
+    from_h: Cell<f64>,
+    to_w: Cell<f64>,
+    to_h: Cell<f64>,
+    /// 0 at the start of a size change, 1 when the pill has arrived.
+    morph: Cell<f64>,
 }
 
 /// Handle to the overlay. Cheap to clone; the window stays on the main thread.
@@ -124,7 +130,7 @@ impl BarController {
         let view = BarView::new(mtm, Arc::clone(&slot));
         let panel = BarPanel::create(
             mtm,
-            NSRect::new(origin, NSSize::new(WINDOW_W, WINDOW_H)),
+            NSRect::new(origin, NSSize::new(WIDTH_RECORDING, PILL_H)),
         );
         configure_panel(&panel);
         panel.setContentView(Some(&*view));
@@ -281,6 +287,7 @@ define_class!(
             if let Some(window) = self.window() {
                 save_origin(window.frame().origin);
             }
+            self.apply_size(self.ivars().cur_w.get(), self.ivars().cur_h.get());
         }
 
         #[unsafe(method(tick:))]
@@ -294,16 +301,25 @@ impl BarView {
     fn new(mtm: MainThreadMarker, slot: Arc<Mutex<BarPhase>>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ViewIvars {
             slot,
-            level: Cell::new(0.0),
             mode: Cell::new(Mode::Hidden),
             raw_message: RefCell::new(String::new()),
             fitted: RefCell::new(String::new()),
-            anim_t: Cell::new(0.0),
+            anim_origin: Cell::new(None),
+            last_tick: Cell::new(None),
             shown: Cell::new(false),
             drag: Cell::new(None),
             timer: OnceCell::new(),
+            floor_db: Cell::new(0.0),
+            voice: Cell::new(0.0),
+            cur_w: Cell::new(WIDTH_RECORDING),
+            cur_h: Cell::new(PILL_H),
+            from_w: Cell::new(WIDTH_RECORDING),
+            from_h: Cell::new(PILL_H),
+            to_w: Cell::new(WIDTH_RECORDING),
+            to_h: Cell::new(PILL_H),
+            morph: Cell::new(1.0),
         });
-        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(WINDOW_W, WINDOW_H));
+        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(WIDTH_RECORDING, PILL_H));
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
@@ -316,9 +332,9 @@ impl BarView {
     }
 
     fn apply_phase(&self) {
+        let dt = self.tick_dt();
         match self.latest_phase() {
             BarPhase::Hidden => {
-                self.ivars().level.set(0.0);
                 if self.ivars().mode.get() != Mode::Hidden {
                     self.ivars().mode.set(Mode::Hidden);
                     self.ivars().raw_message.borrow_mut().clear();
@@ -330,24 +346,32 @@ impl BarView {
                 }
             }
             BarPhase::Recording { level } => {
-                self.ivars().level.set(clamp_level(level));
                 if self.ivars().mode.get() != Mode::Recording {
+                    let from_hidden = !self.ivars().shown.get();
                     self.ivars().mode.set(Mode::Recording);
+                    self.ivars().floor_db.set(0.0);
+                    self.ivars().voice.set(0.0);
+                    self.ivars().anim_origin.set(Some(Instant::now()));
                     self.ivars().raw_message.borrow_mut().clear();
                     self.ivars().fitted.borrow_mut().clear();
-                    self.present(WINDOW_W);
+                    self.begin_size(WIDTH_RECORDING, PILL_H, from_hidden);
+                    self.present();
                 }
-                self.step_anim();
+                self.ingest_level(level, dt);
+                self.step_size(dt);
                 self.setNeedsDisplay(true);
             }
             BarPhase::Processing => {
                 if self.ivars().mode.get() != Mode::Processing {
+                    let from_hidden = !self.ivars().shown.get();
                     self.ivars().mode.set(Mode::Processing);
+                    self.ivars().anim_origin.set(Some(Instant::now()));
                     self.ivars().raw_message.borrow_mut().clear();
                     self.ivars().fitted.borrow_mut().clear();
-                    self.present(WINDOW_W);
+                    self.begin_size(WIDTH_PROCESSING, PILL_H, from_hidden);
+                    self.present();
                 }
-                self.step_anim();
+                self.step_size(dt);
                 self.setNeedsDisplay(true);
             }
             BarPhase::Error { message } => {
@@ -356,33 +380,111 @@ impl BarView {
                 if changed {
                     let font = NSFont::systemFontOfSize(FONT_SIZE);
                     let (fitted, width) = fit_line(&message, &font);
+                    let from_hidden = !self.ivars().shown.get();
                     self.ivars().mode.set(Mode::Error);
                     *self.ivars().raw_message.borrow_mut() = message;
                     *self.ivars().fitted.borrow_mut() = fitted;
-                    self.present(width);
-                    self.setNeedsDisplay(true);
+                    self.begin_size(width, PILL_H, from_hidden);
+                    self.present();
                 }
+                self.step_size(dt);
+                self.setNeedsDisplay(true);
             }
         }
     }
 
-    fn present(&self, width: f64) {
+    fn present(&self) {
         let Some(window) = self.window() else {
             return;
         };
-        resize_centered(&window, width);
         if !self.ivars().shown.get() {
             window.orderFrontRegardless();
             self.ivars().shown.set(true);
         }
     }
 
-    fn step_anim(&self) {
-        let mut t = self.ivars().anim_t.get() + FRAME_DT;
-        if t > 10_000.0 {
-            t -= 10_000.0;
+    fn tick_dt(&self) -> f64 {
+        let now = Instant::now();
+        let dt = match self.ivars().last_tick.replace(Some(now)) {
+            Some(then) => now.saturating_duration_since(then).as_secs_f64(),
+            None => FRAME_DT,
+        };
+        dt.clamp(0.0, 0.1)
+    }
+
+    fn elapsed(&self) -> f64 {
+        let now = Instant::now();
+        let origin = self.ivars().anim_origin.get().unwrap_or_else(|| {
+            self.ivars().anim_origin.set(Some(now));
+            now
+        });
+        now.saturating_duration_since(origin).as_secs_f64()
+    }
+
+    fn ingest_level(&self, level: f32, dt: f64) {
+        let mut floor = self.ivars().floor_db.get();
+        let target = voice_target(f64::from(clamp_level(level)), &mut floor);
+        self.ivars().floor_db.set(floor);
+        let shown = smooth_shown(self.ivars().voice.get(), target, dt);
+        self.ivars().voice.set(shown);
+    }
+
+    fn begin_size(&self, to_w: f64, to_h: f64, from_hidden: bool) {
+        let (from_w, from_h) = if from_hidden {
+            (REST_W, REST_H)
+        } else {
+            (self.ivars().cur_w.get(), self.ivars().cur_h.get())
+        };
+        self.ivars().from_w.set(from_w);
+        self.ivars().from_h.set(from_h);
+        self.ivars().to_w.set(to_w);
+        self.ivars().to_h.set(to_h);
+        self.ivars().morph.set(0.0);
+        self.ivars().cur_w.set(from_w);
+        self.ivars().cur_h.set(from_h);
+        if from_hidden {
+            self.apply_size(from_w, from_h);
         }
-        self.ivars().anim_t.set(t);
+    }
+
+    fn step_size(&self, dt: f64) {
+        let morph = self.ivars().morph.get();
+        let (width, height) = if morph >= 1.0 {
+            (self.ivars().to_w.get(), self.ivars().to_h.get())
+        } else {
+            let next = (morph + dt / MORPH_SECS).min(1.0);
+            self.ivars().morph.set(next);
+            let eased = unit_bezier(0.05, 0.6, 0.4, 0.95, next);
+            let width = lerp(self.ivars().from_w.get(), self.ivars().to_w.get(), eased);
+            let height = lerp(self.ivars().from_h.get(), self.ivars().to_h.get(), eased);
+            self.ivars().cur_w.set(width);
+            self.ivars().cur_h.set(height);
+            (width, height)
+        };
+        self.apply_size(width, height);
+    }
+
+    /// Grows from the center. A drag in progress keeps the frame the pointer is holding.
+    fn apply_size(&self, width: f64, height: f64) {
+        if self.ivars().drag.get().is_some() {
+            return;
+        }
+        let Some(window) = self.window() else {
+            return;
+        };
+        let frame = window.frame();
+        if (frame.size.width - width).abs() < 0.25 && (frame.size.height - height).abs() < 0.25 {
+            return;
+        }
+        let mid_x = frame.origin.x + frame.size.width / 2.0;
+        let mid_y = frame.origin.y + frame.size.height / 2.0;
+        window.setFrame_display(
+            NSRect::new(
+                NSPoint::new(mid_x - width / 2.0, mid_y - height / 2.0),
+                NSSize::new(width, height),
+            ),
+            true,
+        );
     }
 
     fn paint(&self) {
@@ -390,44 +492,24 @@ impl BarView {
         if mode == Mode::Hidden {
             return;
         }
-        let bounds = self.bounds();
-        let pill = pill_rect(bounds);
+        let pill = self.bounds();
         let dark = is_dark(self);
-        let fill = pill_fill(mode, dark);
-
-        NSGraphicsContext::saveGraphicsState_class();
-        let shadow = NSShadow::new();
-        shadow.setShadowOffset(NSSize::new(0.0, -2.0));
-        shadow.setShadowBlurRadius(14.0);
-        shadow.setShadowColor(Some(&NSColor::colorWithWhite_alpha(0.0, 0.28)));
-        shadow.set();
-        let radius = pill.size.height / 2.0;
+        let radius = (pill.size.height / 2.0).min(22.5);
         let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius);
-        fill.setFill();
+        pill_fill(mode, dark).setFill();
         path.fill();
-        NSGraphicsContext::restoreGraphicsState_class();
+        stroke_border(pill);
 
         match mode {
             Mode::Recording => {
-                stroke_rim(&path);
-                let left = cluster_left(pill, 0.0);
-                paint_bars(
-                    left,
-                    pill.mid().y,
-                    f64::from(self.ivars().level.get()),
-                    self.ivars().anim_t.get(),
-                    1.0,
-                );
+                let time = self.elapsed();
+                let scale = audio_scale(self.ivars().voice.get());
+                paint_bars(pill, scale, time, true, false, 1.0);
             }
             Mode::Processing => {
-                let time = self.ivars().anim_t.get();
-                paint_ring(pill, time);
-                let left = cluster_left(pill, SPINNER_GAP + SPINNER_BOX);
-                paint_bars(left, pill.mid().y, 0.03, time, 0.72);
-                paint_spokes(
-                    NSPoint::new(left + bar_row_width() + SPINNER_GAP + SPINNER_BOX / 2.0, pill.mid().y),
-                    time,
-                );
+                let time = self.elapsed();
+                paint_bars(pill, 1.0, time, false, true, 0.4);
+                paint_spinner(spinner_center(pill), time);
             }
             Mode::Error => paint_error(pill, &self.ivars().fitted.borrow(), dark),
             Mode::Hidden => {}
@@ -435,20 +517,20 @@ impl BarView {
     }
 }
 
-fn stroke_rim(path: &NSBezierPath) {
+fn stroke_border(pill: NSRect) {
+    let inset = 0.5;
+    let rect = NSRect::new(
+        NSPoint::new(pill.origin.x + inset, pill.origin.y + inset),
+        NSSize::new(
+            (pill.size.width - inset * 2.0).max(1.0),
+            (pill.size.height - inset * 2.0).max(1.0),
+        ),
+    );
+    let radius = ((pill.size.height / 2.0).min(22.5) - inset).max(0.0);
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
     path.setLineWidth(1.0);
     srgb(48.0 / 255.0, 48.0 / 255.0, 47.0 / 255.0, 1.0).setStroke();
     path.stroke();
-}
-
-fn pill_rect(bounds: NSRect) -> NSRect {
-    NSRect::new(
-        NSPoint::new(INSET, INSET),
-        NSSize::new(
-            (bounds.size.width - INSET * 2.0).max(1.0),
-            (bounds.size.height - INSET * 2.0).max(1.0),
-        ),
-    )
 }
 
 fn pill_fill(mode: Mode, dark: bool) -> Retained<NSColor> {
@@ -458,8 +540,7 @@ fn pill_fill(mode: Mode, dark: bool) -> Retained<NSColor> {
         }
         return srgb(186.0 / 255.0, 48.0 / 255.0, 58.0 / 255.0, 0.94);
     }
-    // The dictation bubble stays black in both appearances.
-    srgb(0.0, 0.0, 0.0, 0.94)
+    srgb(0.0, 0.0, 0.0, 1.0)
 }
 
 fn srgb(red: f64, green: f64, blue: f64, alpha: f64) -> Retained<NSColor> {
@@ -477,59 +558,109 @@ fn is_dark(view: &BarView) -> bool {
     }
 }
 
-const SPINNER_BOX: f64 = 16.0;
-const SPINNER_GAP: f64 = 8.0;
-
-fn bar_row_width() -> f64 {
-    BARS.len() as f64 * BAR_W + (BARS.len() as f64 - 1.0) * BAR_GAP
+fn bars_span() -> f64 {
+    BAR_COUNT as f64 * BAR_W + (BAR_COUNT as f64 - 1.0) * BAR_GAP
 }
 
-fn cluster_left(pill: NSRect, extra: f64) -> f64 {
-    pill.mid().x - (bar_row_width() + extra) / 2.0
+fn cluster_width(with_spinner: bool) -> f64 {
+    let wave = WAVE_PAD_X * 2.0 + bars_span();
+    if with_spinner {
+        wave + CLUSTER_GAP + SPINNER_BOX
+    } else {
+        wave
+    }
 }
 
-fn paint_bars(left: f64, mid_y: f64, level: f64, time: f64, alpha: f64) {
+fn paint_bars(
+    pill: NSRect,
+    audio_scale: f64,
+    time: f64,
+    animate: bool,
+    with_spinner: bool,
+    alpha: f64,
+) {
     NSColor::colorWithWhite_alpha(1.0, alpha).setFill();
-    for (index, &(delay, height_scale)) in BARS.iter().enumerate() {
-        let height = bar_height(level, height_scale, time - delay);
+    let left = pill.origin.x + (pill.size.width - cluster_width(with_spinner)) / 2.0 + WAVE_PAD_X;
+    let mid_y = pill.origin.y + pill.size.height / 2.0;
+    for index in 0..BAR_COUNT {
+        let height = if animate {
+            BAR_BASE * audio_scale * height_share(index) * wave_mul(time - BAR_DELAYS[index])
+        } else {
+            BAR_BASE
+        };
         let rect = NSRect::new(
-            NSPoint::new(left + index as f64 * (BAR_W + BAR_GAP), mid_y - height / 2.0),
+            NSPoint::new(
+                left + index as f64 * (BAR_W + BAR_GAP),
+                mid_y - height / 2.0,
+            ),
             NSSize::new(BAR_W, height),
         );
         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 0.5, 0.5).fill();
     }
 }
 
-/// Shared audio scale, per-bar height share, then the 1s loop at that bar's delay.
-fn bar_height(level: f64, height_scale: f64, local_time: f64) -> f64 {
-    let audio_scale = 5.0 * voice_amount(level) * 0.45;
-    let scale = audio_scale.max(1.0) * height_scale * wave_mul(local_time);
-    let height = BAR_MIN + (BAR_MAX - BAR_MIN) * ((scale - 1.0) / 3.0);
-    height.clamp(BAR_MIN, BAR_MAX)
+fn spinner_center(pill: NSRect) -> NSPoint {
+    let left = pill.origin.x + (pill.size.width - cluster_width(true)) / 2.0;
+    let wave = WAVE_PAD_X * 2.0 + bars_span();
+    NSPoint::new(
+        left + wave + CLUSTER_GAP + SPINNER_BOX / 2.0,
+        pill.origin.y + pill.size.height / 2.0,
+    )
 }
 
-/// Eight ticks on a 6 pt radius. Each fades from 0.88 to 0.15 over 1.1s, a step apart.
-fn paint_spokes(center: NSPoint, time: f64) {
+/// Eight 2×5 capsules on a 6 px radius. Each fades from 0.88 to 0.15 over 1.1s.
+fn paint_spinner(center: NSPoint, time: f64) {
     for index in 0..8 {
         let delay = 0.1375 * -((7 - index) as f64);
         let t = (time - delay).rem_euclid(1.1) / 1.1;
         let alpha = 0.88 + (0.15 - 0.88) * t;
-        let angle = index as f64 * std::f64::consts::FRAC_PI_4;
-        let dir_x = angle.sin();
-        let dir_y = angle.cos();
-        let cx = center.x + dir_x * 6.0;
-        let cy = center.y + dir_y * 6.0;
-        let path = NSBezierPath::new();
-        path.moveToPoint(NSPoint::new(cx - dir_x * 2.5, cy - dir_y * 2.5));
-        path.lineToPoint(NSPoint::new(cx + dir_x * 2.5, cy + dir_y * 2.5));
-        path.setLineWidth(2.0);
-        path.setLineCapStyle(NSLineCapStyle::Round);
-        srgb(163.0 / 255.0, 148.0 / 255.0, 199.0 / 255.0, alpha).setStroke();
-        path.stroke();
+        let theta = index as f64 * std::f64::consts::FRAC_PI_4;
+        let path = capsule(center.x, center.y, theta.sin(), theta.cos());
+        srgb(163.0 / 255.0, 148.0 / 255.0, 199.0 / 255.0, alpha).setFill();
+        path.fill();
     }
 }
 
-/// 1s ease-in-out loop: 1, 1.2, 1.5, 1.1, 1.3, back to 1.
+fn capsule(cx: f64, cy: f64, dir_x: f64, dir_y: f64) -> Retained<NSBezierPath> {
+    let radius = 1.0;
+    let along = 1.5;
+    let ox = cx + dir_x * SPINNER_RADIUS + dir_x * along;
+    let oy = cy + dir_y * SPINNER_RADIUS + dir_y * along;
+    let ix = cx + dir_x * SPINNER_RADIUS - dir_x * along;
+    let iy = cy + dir_y * SPINNER_RADIUS - dir_y * along;
+    let perp_x = -dir_y;
+    let perp_y = dir_x;
+    let path = NSBezierPath::new();
+    let outer = atan2_deg(-perp_y, -perp_x);
+    path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
+        NSPoint::new(ox, oy),
+        radius,
+        outer,
+        outer + 180.0,
+    );
+    let inner = atan2_deg(perp_y, perp_x);
+    path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
+        NSPoint::new(ix, iy),
+        radius,
+        inner,
+        inner + 180.0,
+    );
+    path.closePath();
+    path
+}
+
+fn atan2_deg(y: f64, x: f64) -> f64 {
+    y.atan2(x).to_degrees()
+}
+
+/// Center bars are taller: `max(0, 1 - h²/48)` with `h = abs(4.5 - i)`.
+fn height_share(index: usize) -> f64 {
+    let mid = (BAR_COUNT - 1) as f64 / 2.0;
+    let distance = (mid - index as f64).abs();
+    (1.0 - distance * distance / 48.0).max(0.0)
+}
+
+/// 1s ease-in-out loop. Stops are 1, 1.2, 1.5, 1.1, 1.3, 1.
 fn wave_mul(time: f64) -> f64 {
     let t = time.rem_euclid(1.0);
     const STOPS: [(f64, f64); 6] = [
@@ -545,88 +676,80 @@ fn wave_mul(time: f64) -> f64 {
         let (t1, v1) = pair[1];
         if t <= t1 {
             let span = (t1 - t0).max(f64::EPSILON);
-            let eased = ease_in_out((t - t0) / span);
+            let eased = unit_bezier(0.42, 0.0, 0.58, 1.0, (t - t0) / span);
             return v0 + (v1 - v0) * eased;
         }
     }
     1.0
 }
 
-fn ease_in_out(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Maps this mic's speech into 0..1. A raw peak of 0.05 is already loud here.
-fn voice_amount(level: f64) -> f64 {
-    let span = (LEVEL_FULL - LEVEL_FLOOR).max(f64::EPSILON);
-    let lifted = ((level - LEVEL_FLOOR) / span).clamp(0.0, 1.0);
-    lifted.powf(0.55)
-}
-
-/// One-pixel rainbow ring. One turn takes 6 seconds.
-fn paint_ring(pill: NSRect, time: f64) {
-    NSGraphicsContext::saveGraphicsState_class();
-    let radius = pill.size.height / 2.0;
-    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius).addClip();
-
-    let mid = pill.mid();
-    let reach = pill.size.width.hypot(pill.size.height);
-    let spin = time.rem_euclid(6.0) / 6.0 * 360.0;
-    let steps = 64.0;
-    for index in 0..steps as i32 {
-        let t0 = index as f64 / steps;
-        let t1 = (index as f64 + 1.0) / steps;
-        let (red, green, blue) = ring_color(t0);
-        let path = NSBezierPath::new();
-        path.moveToPoint(mid);
-        path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle(
-            mid,
-            reach,
-            spin + t0 * 360.0,
-            spin + t1 * 360.0,
-        );
-        path.closePath();
-        srgb(red, green, blue, 1.0).setFill();
-        path.fill();
+/// `cubic-bezier` with endpoints fixed at (0, 0) and (1, 1). `x` is the time fraction.
+fn unit_bezier(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
     }
-    NSGraphicsContext::restoreGraphicsState_class();
-
-    let inset = 1.5;
-    let inner = NSRect::new(
-        NSPoint::new(pill.origin.x + inset, pill.origin.y + inset),
-        NSSize::new(
-            (pill.size.width - inset * 2.0).max(1.0),
-            (pill.size.height - inset * 2.0).max(1.0),
-        ),
-    );
-    let inner_radius = inner.size.height / 2.0;
-    srgb(0.0, 0.0, 0.0, 0.96).setFill();
-    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inner, inner_radius, inner_radius)
-        .fill();
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let mut t = x;
+    for _ in 0..8 {
+        let miss = bezier_component(t, x1, x2) - x;
+        let slope = bezier_slope(t, x1, x2);
+        if slope.abs() < 1e-6 {
+            break;
+        }
+        t = (t - miss / slope).clamp(0.0, 1.0);
+    }
+    if (bezier_component(t, x1, x2) - x).abs() > 1e-4 {
+        let mut lo = 0.0;
+        let mut hi = 1.0;
+        for _ in 0..24 {
+            t = (lo + hi) * 0.5;
+            if bezier_component(t, x1, x2) < x {
+                lo = t;
+            } else {
+                hi = t;
+            }
+        }
+    }
+    bezier_component(t, y1, y2)
 }
 
-/// `#f0d7ff`, `#ffbcf2`, `#ff6c4c`, `#ffa946`, `#7232a6`, then back.
-fn ring_color(t: f64) -> (f64, f64, f64) {
-    const STOPS: [(f64, f64, f64); 6] = [
-        (0.941, 0.843, 1.000),
-        (1.000, 0.737, 0.949),
-        (1.000, 0.424, 0.298),
-        (1.000, 0.663, 0.275),
-        (0.447, 0.196, 0.651),
-        (0.941, 0.843, 1.000),
-    ];
-    let t = t.clamp(0.0, 1.0);
-    let scaled = t * (STOPS.len() - 1) as f64;
-    let index = (scaled.floor() as usize).min(STOPS.len() - 2);
-    let frac = scaled - index as f64;
-    let a = STOPS[index];
-    let b = STOPS[index + 1];
-    (
-        a.0 + (b.0 - a.0) * frac,
-        a.1 + (b.1 - a.1) * frac,
-        a.2 + (b.2 - a.2) * frac,
-    )
+fn bezier_component(t: f64, a1: f64, a2: f64) -> f64 {
+    let c = 1.0 - t;
+    3.0 * c * c * t * a1 + 3.0 * c * t * t * a2 + t * t * t
+}
+
+fn bezier_slope(t: f64, a1: f64, a2: f64) -> f64 {
+    let c = 1.0 - t;
+    3.0 * c * c * a1 + 6.0 * c * t * (a2 - a1) + 3.0 * t * t * (1.0 - a2)
+}
+
+fn lerp(from: f64, to: f64, t: f64) -> f64 {
+    from + (to - from) * t
+}
+
+/// Adaptive dBFS normalizer. Silence must not move the floor, or room tone pegs the meter.
+fn voice_target(linear: f64, floor_db: &mut f64) -> f64 {
+    if !linear.is_finite() || linear <= 1e-6 {
+        return 0.0;
+    }
+    let db = 20.0 * linear.log10();
+    if db < *floor_db {
+        *floor_db = db.max(-60.0);
+    }
+    ((db - *floor_db) / 20.0).clamp(0.0, 1.0)
+}
+
+/// One frame of `shown = 0.85*prev + 0.15*target`, scaled for the real tick, then centi-floored.
+fn smooth_shown(previous: f64, target: f64, dt: f64) -> f64 {
+    let keep = 0.85_f64.powf(dt / FRAME_DT);
+    let shown = keep * previous + (1.0 - keep) * target;
+    (shown * 100.0).floor() / 100.0
+}
+
+fn audio_scale(shown: f64) -> f64 {
+    (5.0 * shown).max(1.0)
 }
 
 fn paint_error(pill: NSRect, message: &str, dark: bool) {
@@ -670,11 +793,11 @@ fn text_attributes(
 fn fit_line(message: &str, font: &NSFont) -> (String, f64) {
     let text = collapse_whitespace(message);
     if text.is_empty() {
-        return (String::new(), WINDOW_W);
+        return (String::new(), WIDTH_RECORDING);
     }
-    let max_text = WINDOW_W_MAX - INSET * 2.0 - TEXT_PAD * 2.0;
+    let max_text = WIDTH_MAX - TEXT_PAD * 2.0;
     if measure(&text, font) <= max_text {
-        let width = (measure(&text, font) + INSET * 2.0 + TEXT_PAD * 2.0).clamp(WINDOW_W, WINDOW_W_MAX);
+        let width = (measure(&text, font) + TEXT_PAD * 2.0).clamp(WIDTH_RECORDING, WIDTH_MAX);
         return (text, width);
     }
     let chars: Vec<char> = text.chars().collect();
@@ -701,7 +824,7 @@ fn fit_line(message: &str, font: &NSFont) -> (String, f64) {
             hi = mid - 1;
         }
     }
-    (best, WINDOW_W_MAX)
+    (best, WIDTH_MAX)
 }
 
 fn measure(text: &str, font: &NSFont) -> f64 {
@@ -737,22 +860,6 @@ fn clamp_level(level: f32) -> f32 {
     }
 }
 
-fn resize_centered(window: &NSWindow, width: f64) {
-    let frame = window.frame();
-    if (frame.size.width - width).abs() < 0.5 && (frame.size.height - WINDOW_H).abs() < 0.5 {
-        return;
-    }
-    let mid_x = frame.origin.x + frame.size.width / 2.0;
-    let mid_y = frame.origin.y + frame.size.height / 2.0;
-    window.setFrame_display(
-        NSRect::new(
-            NSPoint::new(mid_x - width / 2.0, mid_y - WINDOW_H / 2.0),
-            NSSize::new(width, WINDOW_H),
-        ),
-        true,
-    );
-}
-
 fn placement_screen(mtm: MainThreadMarker) -> Result<Retained<NSScreen>, BarError> {
     if let Some(screen) = screen_containing(mtm, NSEvent::mouseLocation()) {
         return Ok(screen);
@@ -776,7 +883,7 @@ fn initial_origin(mtm: MainThreadMarker, screen: &NSScreen) -> NSPoint {
     }
     let visible = screen.visibleFrame();
     NSPoint::new(
-        visible.origin.x + (visible.size.width - WINDOW_W) / 2.0,
+        visible.origin.x + (visible.size.width - WIDTH_RECORDING) / 2.0,
         visible.origin.y + MARGIN,
     )
 }
@@ -871,4 +978,73 @@ fn parse_number(text: &str) -> Option<f64> {
         }
     }
     text[..end].parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{audio_scale, height_share, unit_bezier, voice_target, wave_mul};
+
+    #[test]
+    fn outer_bar_height_share_is_fixed() {
+        let share = height_share(0);
+        assert!((share - 0.578125).abs() < 1e-9, "{share}");
+        assert!((height_share(9) - share).abs() < 1e-9);
+    }
+
+    #[test]
+    fn morph_bezier_hits_the_endpoints() {
+        assert_eq!(unit_bezier(0.05, 0.6, 0.4, 0.95, 0.0), 0.0);
+        assert_eq!(unit_bezier(0.05, 0.6, 0.4, 0.95, 1.0), 1.0);
+        let mid = unit_bezier(0.05, 0.6, 0.4, 0.95, 0.5);
+        assert!((mid - 0.860146).abs() < 1e-4, "{mid}");
+    }
+
+    #[test]
+    fn ease_in_out_midpoint_is_linear() {
+        let mid = unit_bezier(0.42, 0.0, 0.58, 1.0, 0.5);
+        assert!((mid - 0.5).abs() < 1e-6, "{mid}");
+        let early = unit_bezier(0.42, 0.0, 0.58, 1.0, 0.25);
+        assert!((early - 0.129162).abs() < 1e-4, "{early}");
+    }
+
+    #[test]
+    fn wave_stops_match_the_keyframes() {
+        let samples = [
+            (0.0, 1.0),
+            (0.2, 1.2),
+            (0.4, 1.5),
+            (0.8, 1.1),
+            (0.9, 1.3),
+            (1.0, 1.0),
+        ];
+        for (time, expected) in samples {
+            let got = wave_mul(time);
+            assert!((got - expected).abs() < 1e-9, "t={time} got={got}");
+        }
+    }
+
+    #[test]
+    fn silence_does_not_pin_the_floor() {
+        let mut floor = 0.0;
+        assert_eq!(voice_target(0.0, &mut floor), 0.0);
+        assert_eq!(floor, 0.0);
+        let quiet = 10f64.powf(-40.0 / 20.0);
+        let _ = voice_target(quiet, &mut floor);
+        assert!((floor - -40.0).abs() < 1e-6);
+        assert_eq!(voice_target(0.0, &mut floor), 0.0);
+        assert!((floor - -40.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn twenty_db_above_the_floor_reaches_scale_five() {
+        let mut floor = 0.0;
+        let quiet = 10f64.powf(-40.0 / 20.0);
+        let idle = voice_target(quiet, &mut floor);
+        assert!(idle.abs() < 1e-6);
+        let loud = 10f64.powf(-20.0 / 20.0);
+        let target = voice_target(loud, &mut floor);
+        assert!((target - 1.0).abs() < 1e-6, "{target}");
+        assert!((audio_scale(target) - 5.0).abs() < 1e-9);
+        assert!((floor - -40.0).abs() < 1e-6);
+    }
 }
