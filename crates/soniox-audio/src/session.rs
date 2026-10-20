@@ -17,16 +17,19 @@ use crate::state::Shared;
 use crate::DictationError;
 
 const SONIOX_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
-const CONFIG_JSON: &str = concat!(
-    r#"{"model":"stt-rt-v5","audio_format":"pcm_s16le","#,
-    r#""sample_rate":16000,"num_channels":1,"enable_endpoint_detection":true}"#
-);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(8);
+/// Soniox rejects a `context` object over 8,000 tokens, which the docs
+/// approximate as 10,000 characters, and then closes the socket. Stay under
+/// that approximation so a long dictionary cannot fail the handshake.
+/// https://soniox.com/docs/stt/concepts/context
+const CONTEXT_CHAR_BUDGET: usize = 9_000;
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub(crate) async fn run_session(
     api_key: String,
+    terms: Vec<String>,
+    languages: Vec<String>,
     shared: std::sync::Arc<Shared>,
     ready_tx: oneshot::Sender<Result<(), DictationError>>,
     mut end_rx: oneshot::Receiver<()>,
@@ -42,7 +45,8 @@ pub(crate) async fn run_session(
     };
 
     let (mut write, mut read) = socket.split();
-    if let Err(error) = write.send(Message::text(CONFIG_JSON)).await {
+    let config = config_json(&terms, &languages);
+    if let Err(error) = write.send(Message::text(config)).await {
         let error = network(&error, &api_key);
         let _ = ready_tx.send(Err(error.clone()));
         return Err(error);
@@ -269,10 +273,145 @@ fn redact_error(error: DictationError, api_key: &str) -> DictationError {
     }
 }
 
+/// First WebSocket text frame. The API key stays on the connection header.
+/// `context` is omitted until there is at least one term. Terms are the
+/// documented vocabulary channel; this does not send `translation_terms`.
+/// Language codes are sent, in the given order, as `language_hints`. A
+/// non-empty list also sets `language_hints_strict`, which asks Soniox to
+/// stay inside that set. https://soniox.com/docs/stt/concepts/language-hints
+pub(crate) fn config_json(terms: &[String], languages: &[String]) -> String {
+    let terms = limit_terms(terms);
+    let languages = limit_languages(languages);
+    let mut value = serde_json::json!({
+        "model": "stt-rt-v5",
+        "audio_format": "pcm_s16le",
+        "sample_rate": 16000,
+        "num_channels": 1,
+        "enable_endpoint_detection": true,
+    });
+    if !languages.is_empty() {
+        value["language_hints"] = serde_json::json!(languages);
+        value["language_hints_strict"] = serde_json::json!(true);
+    }
+    if !terms.is_empty() {
+        value["context"] = serde_json::json!({ "terms": terms });
+    }
+    value.to_string()
+}
+
+fn limit_languages(languages: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    for language in languages {
+        let language = language.trim().to_ascii_lowercase();
+        if language.is_empty() || kept.iter().any(|kept: &String| kept == &language) {
+            continue;
+        }
+        kept.push(language);
+    }
+    kept
+}
+
+/// Keep earlier terms and skip any later term that would push the serialized
+/// `context` object past [`CONTEXT_CHAR_BUDGET`].
+fn limit_terms(terms: &[String]) -> Vec<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    for term in terms {
+        if term.is_empty() {
+            continue;
+        }
+        kept.push(term);
+        if context_object_len(&kept) > CONTEXT_CHAR_BUDGET {
+            kept.pop();
+        }
+    }
+    kept.into_iter().map(str::to_string).collect()
+}
+
+fn context_object_len(terms: &[&str]) -> usize {
+    serde_json::json!({ "terms": terms }).to_string().len()
+}
+
 fn redact(message: &str, api_key: &str) -> String {
     if api_key.is_empty() {
         message.to_string()
     } else {
         message.replace(api_key, "[redacted]")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{config_json, context_object_len, limit_terms, CONTEXT_CHAR_BUDGET};
+
+    #[test]
+    fn empty_terms_omit_context_and_keep_the_pcm_config() {
+        let value: serde_json::Value =
+            serde_json::from_str(&config_json(&[], &["en".into()])).unwrap();
+        assert_eq!(value["model"], "stt-rt-v5");
+        assert_eq!(value["audio_format"], "pcm_s16le");
+        assert_eq!(value["sample_rate"], 16000);
+        assert_eq!(value["num_channels"], 1);
+        assert_eq!(value["enable_endpoint_detection"], true);
+        assert_eq!(value["language_hints"], serde_json::json!(["en"]));
+        assert_eq!(value["language_hints_strict"], true);
+        assert!(value.get("context").is_none());
+        assert!(value.get("api_key").is_none());
+        assert!(value.get("translation").is_none());
+        assert!(value.get("translation_terms").is_none());
+        assert!(value.get("enable_speaker_diarization").is_none());
+        assert!(value.get("enable_language_identification").is_none());
+    }
+
+    #[test]
+    fn language_hints_keep_the_given_order_and_drop_duplicates() {
+        let value: serde_json::Value = serde_json::from_str(&config_json(
+            &[],
+            &["en".into(), "ru".into(), "EN".into(), "  ".into()],
+        ))
+        .unwrap();
+        assert_eq!(value["language_hints"], serde_json::json!(["en", "ru"]));
+        assert_eq!(value["language_hints_strict"], true);
+    }
+
+    #[test]
+    fn no_languages_omit_hints() {
+        let value: serde_json::Value = serde_json::from_str(&config_json(&[], &[])).unwrap();
+        assert!(value.get("language_hints").is_none());
+        assert!(value.get("language_hints_strict").is_none());
+    }
+
+    #[test]
+    fn terms_are_a_context_string_array_and_quotes_round_trip() {
+        let value: serde_json::Value = serde_json::from_str(&config_json(
+            &["Iki".into(), "say \"hi\"".into()],
+            &["en".into()],
+        ))
+        .unwrap();
+        assert_eq!(
+            value["context"]["terms"],
+            serde_json::json!(["Iki", "say \"hi\""])
+        );
+        assert!(value["context"].get("general").is_none());
+        assert!(value["context"].get("text").is_none());
+        assert!(value["context"].get("translation_terms").is_none());
+    }
+
+    #[test]
+    fn terms_stop_before_the_documented_context_budget() {
+        let terms: Vec<String> = (0..700)
+            .map(|index| format!("term-{index:04}-name"))
+            .collect();
+        let kept = limit_terms(&terms);
+        assert!(kept.len() < terms.len());
+        assert_eq!(kept[0], "term-0000-name");
+        assert!(
+            context_object_len(&kept.iter().map(String::as_str).collect::<Vec<_>>())
+                <= CONTEXT_CHAR_BUDGET
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&config_json(&terms, &["en".into()])).unwrap();
+        let sent = value["context"]["terms"].as_array().unwrap();
+        assert_eq!(sent.len(), kept.len());
+        assert!(serde_json::json!({ "terms": sent }).to_string().len() <= CONTEXT_CHAR_BUDGET);
     }
 }

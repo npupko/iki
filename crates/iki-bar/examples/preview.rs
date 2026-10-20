@@ -26,7 +26,8 @@ fn main() {
                 BarPhase::Processing
             } else if t < 11.2 {
                 BarPhase::Error {
-                    message: "Couldn't transcribe that — check your microphone".into(),
+                    title: "No audio received".into(),
+                    body: "We're not hearing anything. There may be an issue with your mic or permissions.".into(),
                 }
             } else {
                 BarPhase::Hidden

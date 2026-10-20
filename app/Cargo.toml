@@ -13,10 +13,13 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",
+    "NSAlert",
     "NSApplication",
     "NSAttributedString",
     "NSBezierPath",
     "NSButton",
+    "NSButtonCell",
+    "NSCell",
     "NSColor",
     "NSControl",
     "NSEvent",
@@ -26,6 +29,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSMenuItem",
     "NSParagraphStyle",
     "NSPasteboard",
+    "NSPopUpButton",
     "NSResponder",
     "NSRunningApplication",
     "NSScreen",
@@ -50,4 +54,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSNotification",
     "NSString",
 ] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

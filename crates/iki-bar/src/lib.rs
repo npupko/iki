@@ -1,4 +1,8 @@
 //! Floating recording pill for Iki.
+//!
+//! An error is a notification card: a black card, a red
+//! circle-exclamation, a short title, and one explanation. The recording
+//! and processing pills stay 30 px tall.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fs;
@@ -21,8 +25,9 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBackingStoreType,
     NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSPanel, NSResponder, NSScreen, NSStatusWindowLevel, NSStringDrawing, NSView, NSWindow,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSLineCapStyle, NSPanel, NSResponder, NSScreen, NSStatusWindowLevel, NSStringDrawing, NSView,
+    NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSDictionary, NSPoint, NSPointInRect, NSRect, NSRunLoop,
@@ -36,10 +41,17 @@ const WIDTH_RECORDING: f64 = 73.0;
 const WIDTH_PROCESSING: f64 = 98.0;
 const REST_W: f64 = 40.0;
 const REST_H: f64 = 8.0;
-const WIDTH_MAX: f64 = 420.0;
-const TEXT_PAD: f64 = 12.0;
-const FONT_SIZE: f64 = 13.0;
 const MARGIN: f64 = 8.0;
+/// Notification card: min 340, max 440, padding 20, radius 24.
+const NOTICE_MIN_W: f64 = 340.0;
+const NOTICE_MAX_W: f64 = 440.0;
+const NOTICE_PAD: f64 = 20.0;
+const NOTICE_RADIUS: f64 = 24.0;
+const NOTICE_GAP: f64 = 12.0;
+const NOTICE_ICON: f64 = 18.0;
+const NOTICE_ICON_GAP: f64 = 8.0;
+const NOTICE_FONT: f64 = 15.0;
+const NOTICE_LINE: f64 = 20.0;
 const FRAME_DT: f64 = 1.0 / 60.0;
 /// `transition: all .1s cubic-bezier(0.05, 0.6, 0.4, 0.95)`.
 const MORPH_SECS: f64 = 0.1;
@@ -60,7 +72,7 @@ pub enum BarPhase {
     Hidden,
     Recording { level: f32 },
     Processing,
-    Error { message: String },
+    Error { title: String, body: String },
 }
 
 #[derive(Debug)]
@@ -99,8 +111,10 @@ struct Drag {
 struct ViewIvars {
     slot: Arc<Mutex<BarPhase>>,
     mode: Cell<Mode>,
-    raw_message: RefCell<String>,
-    fitted: RefCell<String>,
+    raw_title: RefCell<String>,
+    raw_body: RefCell<String>,
+    title_lines: RefCell<Vec<String>>,
+    body_lines: RefCell<Vec<String>>,
     anim_origin: Cell<Option<Instant>>,
     last_tick: Cell<Option<Instant>>,
     shown: Cell<bool>,
@@ -310,8 +324,10 @@ impl BarView {
         let this = Self::alloc(mtm).set_ivars(ViewIvars {
             slot,
             mode: Cell::new(Mode::Hidden),
-            raw_message: RefCell::new(String::new()),
-            fitted: RefCell::new(String::new()),
+            raw_title: RefCell::new(String::new()),
+            raw_body: RefCell::new(String::new()),
+            title_lines: RefCell::new(Vec::new()),
+            body_lines: RefCell::new(Vec::new()),
             anim_origin: Cell::new(None),
             last_tick: Cell::new(None),
             shown: Cell::new(false),
@@ -331,6 +347,13 @@ impl BarView {
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
+    fn clear_notice(&self) {
+        self.ivars().raw_title.borrow_mut().clear();
+        self.ivars().raw_body.borrow_mut().clear();
+        self.ivars().title_lines.borrow_mut().clear();
+        self.ivars().body_lines.borrow_mut().clear();
+    }
+
     fn latest_phase(&self) -> BarPhase {
         self.ivars()
             .slot
@@ -345,8 +368,7 @@ impl BarView {
             BarPhase::Hidden => {
                 if self.ivars().mode.get() != Mode::Hidden {
                     self.ivars().mode.set(Mode::Hidden);
-                    self.ivars().raw_message.borrow_mut().clear();
-                    self.ivars().fitted.borrow_mut().clear();
+                    self.clear_notice();
                     if let Some(window) = self.window() {
                         window.orderOut(None);
                     }
@@ -360,8 +382,7 @@ impl BarView {
                     self.ivars().floor_db.set(0.0);
                     self.ivars().voice.set(0.0);
                     self.ivars().anim_origin.set(Some(Instant::now()));
-                    self.ivars().raw_message.borrow_mut().clear();
-                    self.ivars().fitted.borrow_mut().clear();
+                    self.clear_notice();
                     self.begin_size(WIDTH_RECORDING, PILL_H, from_hidden);
                     self.present();
                 }
@@ -374,25 +395,27 @@ impl BarView {
                     let from_hidden = !self.ivars().shown.get();
                     self.ivars().mode.set(Mode::Processing);
                     self.ivars().anim_origin.set(Some(Instant::now()));
-                    self.ivars().raw_message.borrow_mut().clear();
-                    self.ivars().fitted.borrow_mut().clear();
+                    self.clear_notice();
                     self.begin_size(WIDTH_PROCESSING, PILL_H, from_hidden);
                     self.present();
                 }
                 self.step_size(dt);
                 self.setNeedsDisplay(true);
             }
-            BarPhase::Error { message } => {
+            BarPhase::Error { title, body } => {
                 let changed = self.ivars().mode.get() != Mode::Error
-                    || *self.ivars().raw_message.borrow() != message;
+                    || *self.ivars().raw_title.borrow() != title
+                    || *self.ivars().raw_body.borrow() != body;
                 if changed {
-                    let font = NSFont::systemFontOfSize(FONT_SIZE);
-                    let (fitted, width) = fit_line(&message, &font);
+                    let font = NSFont::systemFontOfSize(NOTICE_FONT);
+                    let laid = layout_notice(&title, &body, |text| measure(text, &font));
                     let from_hidden = !self.ivars().shown.get();
                     self.ivars().mode.set(Mode::Error);
-                    *self.ivars().raw_message.borrow_mut() = message;
-                    *self.ivars().fitted.borrow_mut() = fitted;
-                    self.begin_size(width, PILL_H, from_hidden);
+                    *self.ivars().raw_title.borrow_mut() = title;
+                    *self.ivars().raw_body.borrow_mut() = body;
+                    *self.ivars().title_lines.borrow_mut() = laid.title_lines;
+                    *self.ivars().body_lines.borrow_mut() = laid.body_lines;
+                    self.begin_size(laid.width, laid.height, from_hidden);
                     self.present();
                 }
                 self.step_size(dt);
@@ -521,12 +544,15 @@ impl BarView {
             return;
         }
         let pill = self.bounds();
-        let dark = is_dark(self);
-        let radius = (pill.size.height / 2.0).min(22.5);
+        let radius = if mode == Mode::Error {
+            NOTICE_RADIUS
+        } else {
+            (pill.size.height / 2.0).min(22.5)
+        };
         let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius);
-        pill_fill(mode, dark).setFill();
+        srgb(0.0, 0.0, 0.0, 1.0).setFill();
         path.fill();
-        stroke_border(pill);
+        stroke_border(pill, radius);
 
         match mode {
             Mode::Recording => {
@@ -539,13 +565,21 @@ impl BarView {
                 paint_bars(pill, 1.0, time, false, true, 0.4);
                 paint_spinner(spinner_center(pill), time);
             }
-            Mode::Error => paint_error(pill, &self.ivars().fitted.borrow(), dark),
+            Mode::Error => {
+                let dark = is_dark(self);
+                paint_notice(
+                    pill,
+                    &self.ivars().title_lines.borrow(),
+                    &self.ivars().body_lines.borrow(),
+                    dark,
+                );
+            }
             Mode::Hidden => {}
         }
     }
 }
 
-fn stroke_border(pill: NSRect) {
+fn stroke_border(pill: NSRect, radius: f64) {
     let inset = 0.5;
     let rect = NSRect::new(
         NSPoint::new(pill.origin.x + inset, pill.origin.y + inset),
@@ -554,21 +588,11 @@ fn stroke_border(pill: NSRect) {
             (pill.size.height - inset * 2.0).max(1.0),
         ),
     );
-    let radius = ((pill.size.height / 2.0).min(22.5) - inset).max(0.0);
+    let radius = (radius - inset).max(0.0);
     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
     path.setLineWidth(1.0);
     srgb(48.0 / 255.0, 48.0 / 255.0, 47.0 / 255.0, 1.0).setStroke();
     path.stroke();
-}
-
-fn pill_fill(mode: Mode, dark: bool) -> Retained<NSColor> {
-    if mode == Mode::Error {
-        if dark {
-            return srgb(112.0 / 255.0, 28.0 / 255.0, 36.0 / 255.0, 0.94);
-        }
-        return srgb(186.0 / 255.0, 48.0 / 255.0, 58.0 / 255.0, 0.94);
-    }
-    srgb(0.0, 0.0, 0.0, 1.0)
 }
 
 fn srgb(red: f64, green: f64, blue: f64, alpha: f64) -> Retained<NSColor> {
@@ -780,26 +804,188 @@ fn audio_scale(shown: f64) -> f64 {
     (5.0 * shown).max(1.0)
 }
 
-fn paint_error(pill: NSRect, message: &str, dark: bool) {
-    if message.is_empty() {
+struct NoticeLayout {
+    title_lines: Vec<String>,
+    body_lines: Vec<String>,
+    width: f64,
+    height: f64,
+}
+
+/// Shrink to the text, then clamp to the 340–440 card.
+/// A line that does not fit the maximum card wraps. The card stays 440 wide.
+fn layout_notice(title: &str, body: &str, measure: impl Fn(&str) -> f64) -> NoticeLayout {
+    let title = collapse_whitespace(title);
+    let body = collapse_whitespace(body);
+    let inner_max = NOTICE_MAX_W - NOTICE_PAD * 2.0;
+    let title_max = (inner_max - NOTICE_ICON - NOTICE_ICON_GAP).max(1.0);
+    let title_row = measure(&title) + NOTICE_ICON + NOTICE_ICON_GAP;
+    let body_width = if body.is_empty() { 0.0 } else { measure(&body) };
+    let natural = title_row.max(body_width) + NOTICE_PAD * 2.0;
+    let (title_lines, body_lines, width) = if natural <= NOTICE_MAX_W {
+        (
+            vec![title],
+            if body.is_empty() {
+                Vec::new()
+            } else {
+                vec![body]
+            },
+            natural.max(NOTICE_MIN_W),
+        )
+    } else {
+        (
+            wrap_text(&title, title_max, &measure),
+            wrap_text(&body, inner_max, &measure),
+            NOTICE_MAX_W,
+        )
+    };
+    let title_lines = if title_lines.is_empty() {
+        vec![String::new()]
+    } else {
+        title_lines
+    };
+    let height = notice_height(title_lines.len(), body_lines.len());
+    NoticeLayout {
+        title_lines,
+        body_lines,
+        width,
+        height,
+    }
+}
+
+fn notice_height(title_lines: usize, body_lines: usize) -> f64 {
+    let title_h = title_lines.max(1) as f64 * NOTICE_LINE;
+    let body_h = if body_lines == 0 {
+        0.0
+    } else {
+        NOTICE_GAP + body_lines as f64 * NOTICE_LINE
+    };
+    NOTICE_PAD + title_h + body_h + NOTICE_PAD
+}
+
+fn wrap_text(text: &str, max_width: f64, measure: &impl Fn(&str) -> f64) -> Vec<String> {
+    let text = collapse_whitespace(text);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if measure(&text) <= max_width {
+        return vec![text];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        if current.is_empty() {
+            push_word(&mut lines, &mut current, word, max_width, measure);
+            continue;
+        }
+        let candidate = format!("{current} {word}");
+        if measure(&candidate) <= max_width {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            push_word(&mut lines, &mut current, word, max_width, measure);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn push_word(
+    lines: &mut Vec<String>,
+    current: &mut String,
+    word: &str,
+    max_width: f64,
+    measure: &impl Fn(&str) -> f64,
+) {
+    if measure(word) <= max_width {
+        current.push_str(word);
         return;
     }
-    let font = NSFont::systemFontOfSize(FONT_SIZE);
-    let color = if dark {
-        NSColor::colorWithWhite_alpha(1.0, 1.0)
+    let mut piece = String::new();
+    for ch in word.chars() {
+        let next = format!("{piece}{ch}");
+        if !piece.is_empty() && measure(&next) > max_width {
+            lines.push(std::mem::take(&mut piece));
+        }
+        piece.push(ch);
+    }
+    *current = piece;
+}
+
+fn paint_notice(pill: NSRect, title_lines: &[String], body_lines: &[String], dark: bool) {
+    let font = NSFont::systemFontOfSize(NOTICE_FONT);
+    // Light-theme sand-50 and vast-300. The card stays black, so these stay readable.
+    let title_color = srgb(252.0 / 255.0, 252.0 / 255.0, 251.0 / 255.0, 1.0);
+    let body_color = srgb(179.0 / 255.0, 178.0 / 255.0, 173.0 / 255.0, 1.0);
+    // destructive-500 in light, red-450 in dark.
+    let icon_color = if dark {
+        srgb(1.0, 87.0 / 255.0, 87.0 / 255.0, 1.0)
     } else {
-        NSColor::colorWithWhite_alpha(0.0, 1.0)
+        srgb(238.0 / 255.0, 106.0 / 255.0, 106.0 / 255.0, 1.0)
     };
-    let attrs = text_attributes(&font, Some(&color));
-    let string = NSString::from_str(message);
-    let size = unsafe { string.sizeWithAttributes(Some(&attrs)) };
-    let mid = pill.mid();
-    let baseline = mid.y - (font.ascender() + font.descender()) / 2.0;
+
+    let title_count = title_lines.len().max(1);
+    let title_block = title_count as f64 * NOTICE_LINE;
+    let title_top = pill.origin.y + pill.size.height - NOTICE_PAD;
+    let title_bottom = title_top - title_block;
+    let icon_x = pill.origin.x + NOTICE_PAD;
+    let icon_y = title_bottom + (title_block - NOTICE_ICON) / 2.0;
+    paint_alert_icon(icon_x, icon_y, &icon_color);
+
+    let text_x = icon_x + NOTICE_ICON + NOTICE_ICON_GAP;
+    for (index, line) in title_lines.iter().enumerate() {
+        let row_bottom = title_top - (index as f64 + 1.0) * NOTICE_LINE;
+        draw_line(line, &font, &title_color, text_x, row_bottom);
+    }
+    let body_top = title_bottom - NOTICE_GAP;
+    let body_x = pill.origin.x + NOTICE_PAD;
+    for (index, line) in body_lines.iter().enumerate() {
+        let row_bottom = body_top - (index as f64 + 1.0) * NOTICE_LINE;
+        draw_line(line, &font, &body_color, body_x, row_bottom);
+    }
+}
+
+/// 18 px circle-exclamation. Lucide's 24 px icon, stroke 2, scaled by 0.75.
+fn paint_alert_icon(x: f64, y: f64, color: &NSColor) {
+    color.setStroke();
+    color.setFill();
+    let stroke = 1.5;
+    let cx = x + 9.0;
+    let cy = y + 9.0;
+    let radius = 7.5;
+    let circle = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+        NSPoint::new(cx - radius, cy - radius),
+        NSSize::new(radius * 2.0, radius * 2.0),
+    ));
+    circle.setLineWidth(stroke);
+    circle.stroke();
+
+    let stem = NSBezierPath::new();
+    stem.moveToPoint(NSPoint::new(cx, y + 12.0));
+    stem.lineToPoint(NSPoint::new(cx, y + 9.0));
+    stem.setLineWidth(stroke);
+    stem.setLineCapStyle(NSLineCapStyle::Round);
+    stem.stroke();
+
+    let dot = stroke / 2.0;
+    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+        NSPoint::new(cx - dot, y + 6.0 - dot),
+        NSSize::new(stroke, stroke),
+    ))
+    .fill();
+}
+
+fn draw_line(text: &str, font: &NSFont, color: &NSColor, x: f64, row_bottom: f64) {
+    if text.is_empty() {
+        return;
+    }
+    let baseline =
+        row_bottom + (NOTICE_LINE - (font.ascender() - font.descender())) / 2.0 - font.descender();
+    let attrs = text_attributes(font, Some(color));
+    let string = NSString::from_str(text);
     unsafe {
-        string.drawAtPoint_withAttributes(
-            NSPoint::new(mid.x - size.width / 2.0, baseline),
-            Some(&attrs),
-        );
+        string.drawAtPoint_withAttributes(NSPoint::new(x, baseline), Some(&attrs));
     }
 }
 
@@ -816,43 +1002,6 @@ fn text_attributes(
     } else {
         NSDictionary::from_slices(&[font_key], &[font_obj])
     }
-}
-
-fn fit_line(message: &str, font: &NSFont) -> (String, f64) {
-    let text = collapse_whitespace(message);
-    if text.is_empty() {
-        return (String::new(), WIDTH_RECORDING);
-    }
-    let max_text = WIDTH_MAX - TEXT_PAD * 2.0;
-    if measure(&text, font) <= max_text {
-        let width = (measure(&text, font) + TEXT_PAD * 2.0).clamp(WIDTH_RECORDING, WIDTH_MAX);
-        return (text, width);
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut best = "…".to_string();
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        let mut candidate: String = chars[..mid].iter().collect();
-        while candidate
-            .chars()
-            .next_back()
-            .is_some_and(char::is_whitespace)
-        {
-            candidate.pop();
-        }
-        candidate.push('…');
-        if measure(&candidate, font) <= max_text {
-            best = candidate;
-            lo = mid;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    (best, WIDTH_MAX)
 }
 
 fn measure(text: &str, font: &NSFont) -> f64 {
@@ -1144,10 +1293,7 @@ fn save_origin(origin: NSPoint) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let body = format!(
-        "{{\"x\":{:.4},\"y\":{:.4}}}\n",
-        origin.x, origin.y
-    );
+    let body = format!("{{\"x\":{:.4},\"y\":{:.4}}}\n", origin.x, origin.y);
     let _ = fs::write(path, body);
 }
 
@@ -1211,9 +1357,39 @@ fn parse_number(text: &str) -> Option<f64> {
 mod tests {
     use super::{
         audio_scale, bottom_center, cg_window_to_appkit, height_share, is_focus_window,
-        map_origin, screen_index_for_window, unit_bezier, voice_target, wave_mul, ScreenRect,
-        MARGIN,
+        layout_notice, map_origin, screen_index_for_window, unit_bezier, voice_target, wave_mul,
+        ScreenRect, MARGIN, NOTICE_GAP, NOTICE_LINE, NOTICE_MAX_W, NOTICE_MIN_W, NOTICE_PAD,
     };
+
+    fn chars(text: &str) -> f64 {
+        text.chars().count() as f64 * 10.0
+    }
+
+    #[test]
+    fn short_error_is_the_minimum_card() {
+        let laid = layout_notice("No audio received", "Hi.", chars);
+        assert_eq!(laid.width, NOTICE_MIN_W);
+        assert_eq!(laid.title_lines, vec!["No audio received".to_string()]);
+        assert_eq!(laid.body_lines, vec!["Hi.".to_string()]);
+        assert_eq!(
+            laid.height,
+            NOTICE_PAD + NOTICE_LINE + NOTICE_GAP + NOTICE_LINE + NOTICE_PAD
+        );
+    }
+
+    #[test]
+    fn long_error_wraps_inside_the_maximum_card() {
+        let body =
+            "We're not hearing anything. There may be an issue with your mic or permissions.";
+        let laid = layout_notice("No audio received", body, chars);
+        assert_eq!(laid.width, NOTICE_MAX_W);
+        assert!(laid.body_lines.len() >= 2, "{:?}", laid.body_lines);
+        let inner = NOTICE_MAX_W - NOTICE_PAD * 2.0;
+        for line in &laid.body_lines {
+            assert!(chars(line) <= inner + 1e-6, "{line}");
+        }
+        assert_eq!(laid.body_lines.join(" "), body);
+    }
 
     #[test]
     fn outer_bar_height_share_is_fixed() {

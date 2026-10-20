@@ -1,7 +1,10 @@
 //! Hold the Globe key to dictate. Releasing it pastes the Soniox transcript.
 
 mod dashboard;
+mod dictionary;
+mod dictionary_ui;
 mod history;
+mod languages;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -9,16 +12,16 @@ use std::time::Duration;
 
 use iki_bar::{BarPhase, BarController};
 use globe_input::{HoldEdge, HoldWatch};
-use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2::msg_send;
 use objc2::sel;
+use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
     NSVariableStatusItemLength,
 };
 use objc2_foundation::NSString;
-use soniox_audio::{DictationConfig, DictationHandle};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use soniox_audio::{DictationConfig, DictationError, DictationHandle};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 fn main() {
     let mtm = MainThreadMarker::new().expect("Iki must start on the main thread");
@@ -39,8 +42,10 @@ fn main() {
         })
     };
     if let Err(error) = &watch {
+        let notice = notice_for_input(error);
         bar.set_phase(BarPhase::Error {
-            message: error.to_string(),
+            title: notice.title,
+            body: notice.body,
         });
         eprintln!("globe key: {error}");
         if matches!(error, globe_input::InputError::EventTapUnavailable) {
@@ -50,8 +55,10 @@ fn main() {
 
     let api_key = load_api_key();
     if api_key.is_empty() {
+        let notice = missing_key_notice();
         bar.set_phase(BarPhase::Error {
-            message: "Set SONIOX_API_KEY".into(),
+            title: notice.title,
+            body: notice.body,
         });
     }
 
@@ -73,6 +80,7 @@ fn install_status_item(
     }
 
     let menu = NSMenu::new(mtm);
+    dictionary_ui::add_menu_item(&menu, mtm);
     dashboard::add_menu_item(&menu, mtm);
     let quit = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -122,7 +130,11 @@ fn fnox_key() -> Option<String> {
     }
     let key = String::from_utf8(output.stdout).ok()?;
     let key = key.trim().to_string();
-    if key.is_empty() { None } else { Some(key) }
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
 }
 
 fn fnox_binary() -> Option<PathBuf> {
@@ -162,7 +174,7 @@ async fn dictation_loop(
         }
 
         if api_key.is_empty() {
-            show_error(&bar, "Set SONIOX_API_KEY").await;
+            show_notice(&bar, missing_key_notice()).await;
             continue;
         }
 
@@ -171,6 +183,8 @@ async fn dictation_loop(
 
         let start = DictationHandle::start(DictationConfig {
             api_key: api_key.clone(),
+            terms: dictionary::recognition_terms(),
+            languages: languages::codes(),
         });
         tokio::pin!(start);
         let mut released = false;
@@ -188,21 +202,23 @@ async fn dictation_loop(
         let mut handle = match handle {
             Ok(handle) => handle,
             Err(error) => {
-                show_error(&bar, &error.to_string()).await;
+                show_dictation_error(&bar, error).await;
                 continue;
             }
         };
 
         // The mic is already playing. Read it now, instead of waiting for the socket.
         if !released {
-            bar.set_phase(BarPhase::Recording { level: handle.rms() });
+            bar.set_phase(BarPhase::Recording {
+                level: handle.rms(),
+            });
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(16)) => {
                         if let Some(error) = handle.connect_error() {
                             let _ = handle.finish().await;
                             play_dictation("stop");
-                            show_error(&bar, &error.to_string()).await;
+                            show_dictation_error(&bar, error).await;
                             continue 'hold;
                         }
                         bar.set_phase(BarPhase::Recording { level: handle.rms() });
@@ -218,7 +234,7 @@ async fn dictation_loop(
         if let Some(error) = handle.connect_error() {
             let _ = handle.finish().await;
             play_dictation("stop");
-            show_error(&bar, &error.to_string()).await;
+            show_dictation_error(&bar, error).await;
             continue;
         }
 
@@ -226,27 +242,123 @@ async fn dictation_loop(
         bar.set_phase(BarPhase::Processing);
         match handle.finish().await {
             Ok(text) => {
-                let text = text.trim();
-                if text.is_empty() {
+                let original = text.trim();
+                if original.is_empty() {
                     bar.set_phase(BarPhase::Hidden);
                     continue;
                 }
-                history::record(text);
-                match globe_input::paste_text(text) {
+                dictionary::note_uses(original);
+                let text = dictionary::apply(original);
+                history::record(&text);
+                match globe_input::paste_text(&text) {
                     Ok(()) => {
                         bar.set_phase(BarPhase::Hidden);
                     }
-                    Err(error) => show_error(&bar, &error.to_string()).await,
+                    Err(error) => {
+                        eprintln!("iki: {error}");
+                        show_notice(&bar, notice_for_input(&error)).await;
+                    }
                 }
             }
-            Err(error) => show_error(&bar, &error.to_string()).await,
+            Err(error) => show_dictation_error(&bar, error).await,
         }
     }
 }
 
-async fn show_error(bar: &BarController, message: &str) {
+struct Notice {
+    title: String,
+    body: String,
+}
+
+fn notice_for_dictation(error: &DictationError) -> Option<Notice> {
+    Some(match error {
+        DictationError::Cancelled => return None,
+        DictationError::MissingApiKey => missing_key_notice(),
+        DictationError::Microphone(_) => Notice {
+            title: "Microphone isn't available".into(),
+            body: "Check that it's connected, and that Iki is allowed to use it.".into(),
+        },
+        DictationError::Network(_) => Notice {
+            title: "Can't reach Soniox".into(),
+            body: "Check your connection and try again.".into(),
+        },
+        DictationError::Protocol(detail) => protocol_notice(detail),
+    })
+}
+
+fn protocol_notice(detail: &str) -> Notice {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("no audio") {
+        Notice {
+            title: "No audio received".into(),
+            body: "We're not hearing anything. There may be an issue with your mic or permissions."
+                .into(),
+        }
+    } else if lower.contains("context is too long") {
+        Notice {
+            title: "Dictionary is too long".into(),
+            body: "Star the names you use most, then try again.".into(),
+        }
+    } else if is_auth_failure(&lower) {
+        Notice {
+            title: "Soniox rejected the key".into(),
+            body: "Check SONIOX_API_KEY, or the key in Application Support, then relaunch.".into(),
+        }
+    } else {
+        Notice {
+            title: "Transcription didn't finish".into(),
+            body: "Try again in a moment.".into(),
+        }
+    }
+}
+
+fn is_auth_failure(detail: &str) -> bool {
+    detail.contains("api key")
+        || detail.contains("api_key")
+        || detail.contains("unauthorized")
+        || detail.contains("authentication")
+        || detail.contains("401")
+        || detail.contains("forbidden")
+}
+
+fn notice_for_input(error: &globe_input::InputError) -> Notice {
+    match error {
+        globe_input::InputError::Clipboard(_)
+        | globe_input::InputError::EventSource
+        | globe_input::InputError::KeyboardEvent => Notice {
+            title: "Couldn't paste".into(),
+            body: "Click the field you want, then dictate again.".into(),
+        },
+        globe_input::InputError::EventTapUnavailable | globe_input::InputError::RunLoopSource => {
+            Notice {
+                title: "Allow Iki in Accessibility".into(),
+                body: "Turn on Iki under Privacy & Security, Device Control and Data Access, then relaunch.".into(),
+            }
+        }
+    }
+}
+
+fn missing_key_notice() -> Notice {
+    Notice {
+        title: "Add your Soniox key".into(),
+        body: "Set SONIOX_API_KEY, or put the key in Iki's Application Support folder, then relaunch.".into(),
+    }
+}
+
+async fn show_dictation_error(bar: &BarController, error: DictationError) {
+    match notice_for_dictation(&error) {
+        Some(notice) => {
+            eprintln!("iki: {error}");
+            show_notice(bar, notice).await;
+        }
+        None => bar.set_phase(BarPhase::Hidden),
+    }
+}
+
+async fn show_notice(bar: &BarController, notice: Notice) {
     bar.set_phase(BarPhase::Error {
-        message: message.to_string(),
+        title: notice.title,
+        body: notice.body,
     });
     tokio::time::sleep(Duration::from_secs(4)).await;
     bar.set_phase(BarPhase::Hidden);
@@ -298,4 +410,55 @@ fn dictation_sound(which: &str) -> Option<PathBuf> {
         .join("../assets/sounds")
         .join(name);
     dev.is_file().then_some(dev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{notice_for_dictation, notice_for_input};
+    use soniox_audio::DictationError;
+
+    #[test]
+    fn no_audio_is_a_plain_sentence() {
+        let notice = notice_for_dictation(&DictationError::Protocol(
+            "invalid_request: No audio received.".into(),
+        ))
+        .expect("shown");
+        assert_eq!(notice.title, "No audio received");
+        assert!(notice.body.contains("mic"));
+        let shown = format!("{} {}", notice.title, notice.body).to_ascii_lowercase();
+        assert!(!shown.contains("protocol"));
+        assert!(!shown.contains("invalid_request"));
+    }
+
+    #[test]
+    fn cancelled_dictation_has_no_notice() {
+        assert!(notice_for_dictation(&DictationError::Cancelled).is_none());
+    }
+
+    #[test]
+    fn context_limit_talks_about_the_dictionary() {
+        let notice = notice_for_dictation(&DictationError::Protocol(
+            "invalid_request: Context is too long: 9001 tokens, the maximum is 8000 tokens.".into(),
+        ))
+        .expect("shown");
+        assert_eq!(notice.title, "Dictionary is too long");
+        assert!(!notice.body.to_ascii_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn rejected_key_hides_the_status_code() {
+        let notice = notice_for_dictation(&DictationError::Protocol(
+            "authentication_error: invalid api key".into(),
+        ))
+        .expect("shown");
+        assert_eq!(notice.title, "Soniox rejected the key");
+        assert!(!notice.body.to_ascii_lowercase().contains("authentication"));
+    }
+
+    #[test]
+    fn accessibility_notice_names_the_setting() {
+        let notice = notice_for_input(&globe_input::InputError::EventTapUnavailable);
+        assert_eq!(notice.title, "Allow Iki in Accessibility");
+        assert!(notice.body.contains("Device Control and Data Access"));
+    }
 }

@@ -8,10 +8,9 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSBezierPath, NSBorderType, NSColor, NSEvent, NSFont,
     NSFontAttributeName, NSForegroundColorAttributeName, NSLineBreakMode, NSMenu, NSMenuItem,
-    NSMutableParagraphStyle,
-    NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeString, NSResponder, NSScreen,
-    NSScrollView, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTextField, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard, NSPasteboardTypeString,
+    NSResponder, NSScreen, NSScrollView, NSStringDrawingOptions, NSStringNSExtendedStringDrawing,
+    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSAttributedStringKey, NSCalendar, NSCalendarUnit, NSDate, NSDateFormatter,
@@ -103,7 +102,8 @@ impl Dashboard {
         stats.setSelectable(false);
         stats.setMaximumNumberOfLines(1);
         let font = NSFont::systemFontOfSize(13.0);
-        let _: () = unsafe { msg_send![&*stats, setLineBreakMode: NSLineBreakMode::ByTruncatingTail] };
+        let _: () =
+            unsafe { msg_send![&*stats, setLineBreakMode: NSLineBreakMode::ByTruncatingTail] };
         let _: () = unsafe { msg_send![&*stats, setFont: &*font] };
 
         let list = TranscriptList::new(mtm);
@@ -154,7 +154,7 @@ impl Dashboard {
     }
 }
 
-fn center_on_mouse_screen(window: &NSWindow, mtm: MainThreadMarker) {
+pub(crate) fn center_on_mouse_screen(window: &NSWindow, mtm: MainThreadMarker) {
     let frame = window.frame();
     let Some(screen) = screen_under_mouse(mtm) else {
         return;

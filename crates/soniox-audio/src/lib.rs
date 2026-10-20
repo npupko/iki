@@ -23,6 +23,10 @@ pub use crate::protocol::LiveTranscript;
 #[derive(Debug)]
 pub struct DictationConfig {
     pub api_key: String,
+    /// Spellings Soniox should recognize. Sent as `context.terms` when non-empty.
+    pub terms: Vec<String>,
+    /// ISO codes in priority order. Sent as `language_hints` when non-empty.
+    pub languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -61,9 +65,11 @@ impl DictationHandle {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (end_tx, end_rx) = oneshot::channel();
         let api_key = config.api_key;
+        let terms = config.terms;
+        let languages = config.languages;
         let session_shared = Arc::clone(&shared);
         let session = tokio::spawn(async move {
-            session::run_session(api_key, session_shared, ready_tx, end_rx).await
+            session::run_session(api_key, terms, languages, session_shared, ready_tx, end_rx).await
         });
 
         Ok(Self {
@@ -173,6 +179,8 @@ mod tests {
     async fn empty_api_key_is_rejected_before_the_microphone_opens() {
         let started = DictationHandle::start(DictationConfig {
             api_key: String::new(),
+            terms: Vec::new(),
+            languages: Vec::new(),
         })
         .await;
         match started {
