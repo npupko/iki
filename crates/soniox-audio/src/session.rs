@@ -31,11 +31,9 @@ pub(crate) async fn run_session(
     ready_tx: oneshot::Sender<Result<(), DictationError>>,
     mut end_rx: oneshot::Receiver<()>,
 ) -> Result<String, DictationError> {
-    let connected = tokio::select! {
-        result = connect_soniox(&api_key) => result,
-        _ = &mut end_rx => Err(DictationError::Cancelled),
-    };
-    let socket = match connected {
+    // A key-up during connect must not discard the samples already queued.
+    // Finish the handshake, then the loop below sees `end_rx` and flushes.
+    let socket = match connect_soniox(&api_key).await {
         Ok(socket) => socket,
         Err(error) => {
             let _ = ready_tx.send(Err(error.clone()));

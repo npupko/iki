@@ -16,8 +16,17 @@ pub(crate) const MAX_PCM_BYTES: usize = TARGET_RATE as usize * 2 * 10;
 pub(crate) struct Shared {
     pcm: Mutex<VecDeque<u8>>,
     level: AtomicU32,
+    /// Sum of per-callback RMS values and how many callbacks that covers.
+    /// `take_rms` returns the mean and keeps the last value if nothing new arrived.
+    rms: Mutex<RmsAccum>,
     transcript: Mutex<LiveTranscript>,
     mic_error: Mutex<Option<String>>,
+}
+
+struct RmsAccum {
+    sum: f64,
+    count: u32,
+    last: f32,
 }
 
 impl Shared {
@@ -25,6 +34,11 @@ impl Shared {
         Self {
             pcm: Mutex::new(VecDeque::with_capacity(TARGET_RATE as usize * 2)),
             level: AtomicU32::new(0.0_f32.to_bits()),
+            rms: Mutex::new(RmsAccum {
+                sum: 0.0,
+                count: 0,
+                last: 0.0,
+            }),
             transcript: Mutex::new(LiveTranscript::empty()),
             mic_error: Mutex::new(None),
         }
@@ -39,6 +53,27 @@ impl Shared {
 
     pub(crate) fn level(&self) -> f32 {
         sanitize_level(f32::from_bits(self.level.load(Ordering::Relaxed)))
+    }
+
+    /// Linear RMS (0..=1) of mono samples since the previous take.
+    pub(crate) fn push_rms(&self, rms: f32) {
+        let rms = sanitize_level(rms);
+        let mut accum = lock(&self.rms);
+        accum.sum += f64::from(rms);
+        accum.count = accum.count.saturating_add(1);
+    }
+
+    pub(crate) fn take_rms(&self) -> f32 {
+        let mut accum = lock(&self.rms);
+        if accum.count == 0 {
+            return accum.last;
+        }
+        let mean = accum.sum / f64::from(accum.count);
+        accum.sum = 0.0;
+        accum.count = 0;
+        let mean = sanitize_level(mean as f32);
+        accum.last = mean;
+        mean
     }
 
     pub(crate) fn push_pcm(&self, samples: &[i16]) {

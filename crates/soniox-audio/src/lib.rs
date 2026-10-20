@@ -1,8 +1,8 @@
 //! Default-microphone capture streamed to the Soniox realtime WebSocket.
 //!
-//! Call [`DictationHandle::start`] from a Tokio runtime. No audio leaves the
-//! machine until the config text frame has been written; samples recorded
-//! during connect are queued (at most about ten seconds).
+//! Call [`DictationHandle::start`] from a Tokio runtime. The handle returns
+//! once the microphone is playing. Samples recorded while the socket connects
+//! are queued (at most about ten seconds) and sent after the config frame.
 
 mod audio;
 mod protocol;
@@ -44,10 +44,13 @@ pub struct DictationHandle {
     mic: MicCapture,
     end_tx: Option<oneshot::Sender<()>>,
     session: Option<JoinHandle<Result<String, DictationError>>>,
+    ready_rx: Option<oneshot::Receiver<Result<(), DictationError>>>,
 }
 
 impl DictationHandle {
-    /// Opens the mic and the Soniox socket. Buffers mic audio until the socket is ready, then streams.
+    /// Opens the microphone and returns as soon as it is playing.
+    /// The Soniox socket connects on a background task. [`Self::connect_error`]
+    /// reports a failed handshake while the caller is still holding the key.
     pub async fn start(config: DictationConfig) -> Result<Self, DictationError> {
         if config.api_key.is_empty() {
             return Err(DictationError::MissingApiKey);
@@ -63,59 +66,45 @@ impl DictationHandle {
             session::run_session(api_key, session_shared, ready_tx, end_rx).await
         });
 
-        let mut guard = StartGuard {
-            mic: Some(mic),
+        Ok(Self {
+            shared,
+            mic,
+            end_tx: Some(end_tx),
             session: Some(session),
-            armed: true,
-        };
+            ready_rx: Some(ready_rx),
+        })
+    }
 
-        match ready_rx.await {
+    /// `Some` when the socket failed. `None` while it is still connecting, or after it is up.
+    /// If the ready channel closes without a value, [`Self::finish`] reports that error.
+    pub fn connect_error(&mut self) -> Option<DictationError> {
+        let rx = self.ready_rx.as_mut()?;
+        match rx.try_recv() {
             Ok(Ok(())) => {
-                let mic = guard.mic.take().expect("mic still held");
-                let session = guard.session.take().expect("session still held");
-                guard.armed = false;
-                Ok(Self {
-                    shared,
-                    mic,
-                    end_tx: Some(end_tx),
-                    session: Some(session),
-                })
+                self.ready_rx = None;
+                None
             }
             Ok(Err(error)) => {
-                if let Some(mic) = guard.mic.as_mut() {
-                    mic.stop();
-                }
-                if let Some(session) = guard.session.take() {
-                    let _ = session.await;
-                }
-                guard.armed = false;
-                Err(error)
+                self.ready_rx = None;
+                Some(error)
             }
-            Err(_dropped) => {
-                if let Some(mic) = guard.mic.as_mut() {
-                    mic.stop();
-                }
-                let joined = if let Some(session) = guard.session.take() {
-                    session.abort();
-                    Some(session.await)
-                } else {
-                    None
-                };
-                guard.armed = false;
-                match joined {
-                    Some(Ok(Err(error))) => Err(error),
-                    Some(Ok(Ok(_))) => Err(DictationError::Network(
-                        "session ended before it was ready".to_string(),
-                    )),
-                    _ => Err(DictationError::Cancelled),
-                }
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.ready_rx = None;
+                None
             }
         }
     }
 
-    /// Latest mic level, 0.0..=1.0, safe from any thread.
+    /// Latest mic peak, 0.0..=1.0, safe from any thread.
     pub fn level(&self) -> f32 {
         self.shared.level()
+    }
+
+    /// Mean linear RMS since the last call, 0.0..=1.0. This is the amplitude
+    /// the pill turns into dBFS. Safe from any thread.
+    pub fn rms(&self) -> f32 {
+        self.shared.take_rms()
     }
 
     /// Committed finals plus the current non-final hypothesis. Safe from any thread.
@@ -154,26 +143,6 @@ impl Drop for DictationHandle {
     fn drop(&mut self) {
         self.mic.stop();
         self.end_tx.take();
-        if let Some(session) = self.session.take() {
-            session.abort();
-        }
-    }
-}
-
-struct StartGuard {
-    mic: Option<MicCapture>,
-    session: Option<JoinHandle<Result<String, DictationError>>>,
-    armed: bool,
-}
-
-impl Drop for StartGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(mic) = self.mic.as_mut() {
-            mic.stop();
-        }
         if let Some(session) = self.session.take() {
             session.abort();
         }

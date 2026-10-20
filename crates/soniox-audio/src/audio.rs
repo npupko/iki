@@ -145,6 +145,7 @@ where
                 }
                 let frames = data.len() / channels;
                 let mut peak = 0.0_f32;
+                let mut sum_sq = 0.0_f32;
                 pending.clear();
                 for frame in 0..frames {
                     let mut sum = 0.0_f32;
@@ -154,9 +155,13 @@ where
                     }
                     let mono = sum / channels as f32;
                     peak = peak.max(mono.abs());
+                    sum_sq += mono * mono;
                     resampler.push(mono, |sample| pending.push(f32_to_i16(sample)));
                 }
                 shared.push_level(peak);
+                if frames > 0 {
+                    shared.push_rms((sum_sq / frames as f32).sqrt());
+                }
                 shared.push_pcm(&pending);
             },
             error_callback,

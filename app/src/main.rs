@@ -150,7 +150,7 @@ async fn dictation_loop(
     bar: BarController,
     api_key: String,
 ) {
-    loop {
+    'hold: loop {
         match rx.recv().await {
             Some(HoldEdge::Down) => {}
             Some(HoldEdge::Up) => continue,
@@ -181,7 +181,7 @@ async fn dictation_loop(
             }
         };
 
-        let handle = match handle {
+        let mut handle = match handle {
             Ok(handle) => handle,
             Err(error) => {
                 show_error(&bar, &error.to_string()).await;
@@ -189,11 +189,18 @@ async fn dictation_loop(
             }
         };
 
+        // The mic is already playing. Read it now, instead of waiting for the socket.
         if !released {
+            bar.set_phase(BarPhase::Recording { level: handle.rms() });
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(33)) => {
-                        bar.set_phase(BarPhase::Recording { level: handle.level() });
+                    _ = tokio::time::sleep(Duration::from_millis(16)) => {
+                        if let Some(error) = handle.connect_error() {
+                            let _ = handle.finish().await;
+                            show_error(&bar, &error.to_string()).await;
+                            continue 'hold;
+                        }
+                        bar.set_phase(BarPhase::Recording { level: handle.rms() });
                     }
                     edge = rx.recv() => match edge {
                         Some(HoldEdge::Up) | None => break,
@@ -201,6 +208,12 @@ async fn dictation_loop(
                     },
                 }
             }
+        }
+
+        if let Some(error) = handle.connect_error() {
+            let _ = handle.finish().await;
+            show_error(&bar, &error.to_string()).await;
+            continue;
         }
 
         bar.set_phase(BarPhase::Processing);
