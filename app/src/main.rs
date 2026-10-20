@@ -162,7 +162,7 @@ async fn dictation_loop(
             continue;
         }
 
-        play("Pop");
+        play_dictation("start");
         bar.set_phase(BarPhase::Recording { level: 0.0 });
 
         let start = DictationHandle::start(DictationConfig {
@@ -197,6 +197,7 @@ async fn dictation_loop(
                     _ = tokio::time::sleep(Duration::from_millis(16)) => {
                         if let Some(error) = handle.connect_error() {
                             let _ = handle.finish().await;
+                            play_dictation("stop");
                             show_error(&bar, &error.to_string()).await;
                             continue 'hold;
                         }
@@ -212,10 +213,12 @@ async fn dictation_loop(
 
         if let Some(error) = handle.connect_error() {
             let _ = handle.finish().await;
+            play_dictation("stop");
             show_error(&bar, &error.to_string()).await;
             continue;
         }
 
+        play_dictation("stop");
         bar.set_phase(BarPhase::Processing);
         match handle.finish().await {
             Ok(text) => {
@@ -226,7 +229,6 @@ async fn dictation_loop(
                 }
                 match globe_input::paste_text(text) {
                     Ok(()) => {
-                        play("Tink");
                         bar.set_phase(BarPhase::Hidden);
                     }
                     Err(error) => show_error(&bar, &error.to_string()).await,
@@ -264,12 +266,31 @@ fn open_accessibility_settings() {
     }
 }
 
-fn play(name: &str) {
-    let path = format!("/System/Library/Sounds/{name}.aiff");
+/// `assets/sounds` is copied into the app bundle by `scripts/bundle.sh`.
+fn play_dictation(which: &str) {
+    let Some(path) = dictation_sound(which) else {
+        return;
+    };
     let _ = Command::new("afplay")
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+fn dictation_sound(which: &str) -> Option<PathBuf> {
+    let name = format!("dictation-{which}.wav");
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("../Resources/sounds").join(&name);
+            if bundled.is_file() {
+                return Some(bundled);
+            }
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../assets/sounds")
+        .join(name);
+    dev.is_file().then_some(dev)
 }
