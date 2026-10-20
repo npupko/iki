@@ -6,6 +6,8 @@ publish = false
 description = "Floating recording pill for Iki"
 
 [dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
@@ -27,6 +29,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSStringDrawing",
     "NSView",
     "NSWindow",
+    "NSWorkspace",
+    "libc",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",

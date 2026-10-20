@@ -6,6 +6,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryGetValue, CFDictionaryRef};
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFStringRef;
+use core_graphics::geometry::CGRect;
+use core_graphics::window::{
+    copy_window_info, kCGNullWindowID, kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer,
+    kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
+};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -13,8 +22,7 @@ use objc2_app_kit::{
     NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBackingStoreType,
     NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
     NSPanel, NSResponder, NSScreen, NSStatusWindowLevel, NSStringDrawing, NSView, NSWindow,
-    NSWindowAnimationBehavior,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSDictionary, NSPoint, NSPointInRect, NSRect, NSRunLoop,
@@ -124,8 +132,8 @@ impl BarController {
     pub fn install() -> Result<Self, BarError> {
         let mtm = MainThreadMarker::new().ok_or(BarError::NotMainThread)?;
         let _app = objc2_app_kit::NSApplication::sharedApplication(mtm);
-        let screen = placement_screen(mtm)?;
-        let origin = initial_origin(mtm, &screen);
+        let screen = focused_screen(mtm)?;
+        let origin = origin_for_screen(mtm, &screen, (WIDTH_RECORDING, PILL_H));
         let slot = Arc::new(Mutex::new(BarPhase::Hidden));
         let view = BarView::new(mtm, Arc::clone(&slot));
         let panel = BarPanel::create(
@@ -398,9 +406,29 @@ impl BarView {
             return;
         };
         if !self.ivars().shown.get() {
+            self.move_to_focused_screen(&window);
             window.orderFrontRegardless();
             self.ivars().shown.set(true);
         }
+    }
+
+    /// Move only when the pill is about to appear. A hold that is already
+    /// showing stays on the screen where it started, including processing.
+    fn move_to_focused_screen(&self, window: &NSWindow) {
+        if self.ivars().drag.get().is_some() {
+            return;
+        }
+        let mtm = self.mtm();
+        let Ok(screen) = focused_screen(mtm) else {
+            return;
+        };
+        let pill = (self.ivars().to_w.get(), self.ivars().to_h.get());
+        let desired = origin_for_screen(mtm, &screen, pill);
+        let frame = window.frame();
+        window.setFrameOrigin(NSPoint::new(
+            desired.x + (pill.0 - frame.size.width) / 2.0,
+            desired.y + (pill.1 - frame.size.height) / 2.0,
+        ));
     }
 
     fn tick_dt(&self) -> f64 {
@@ -860,11 +888,20 @@ fn clamp_level(level: f32) -> f32 {
     }
 }
 
-fn placement_screen(mtm: MainThreadMarker) -> Result<Retained<NSScreen>, BarError> {
-    if let Some(screen) = screen_containing(mtm, NSEvent::mouseLocation()) {
+/// Screen the user is typing on.
+///
+/// `NSScreen.main` is the screen of the key window, but an LSUIElement app
+/// can be given the menu-bar screen instead when displays do not have
+/// separate Spaces (FB11506568). The frontmost app's top on-screen window
+/// is the display that actually has the keyboard.
+fn focused_screen(mtm: MainThreadMarker) -> Result<Retained<NSScreen>, BarError> {
+    if let Some(screen) = screen_of_front_window(mtm) {
         return Ok(screen);
     }
     if let Some(screen) = NSScreen::mainScreen(mtm) {
+        return Ok(screen);
+    }
+    if let Some(screen) = screen_containing(mtm, NSEvent::mouseLocation()) {
         return Ok(screen);
     }
     let screens = NSScreen::screens(mtm);
@@ -875,17 +912,207 @@ fn placement_screen(mtm: MainThreadMarker) -> Result<Retained<NSScreen>, BarErro
     }
 }
 
-fn initial_origin(mtm: MainThreadMarker, screen: &NSScreen) -> NSPoint {
-    if let Some(saved) = load_origin() {
-        if screen_containing(mtm, saved).is_some() {
-            return saved;
+fn screen_of_front_window(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+    let front = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    let pid = i64::from(front.processIdentifier());
+    if pid <= 0 {
+        return None;
+    }
+    let screens = NSScreen::screens(mtm);
+    if screens.count() == 0 {
+        return None;
+    }
+    let primary_height = screens.objectAtIndex(0).frame().size.height;
+    let window = front_window_bounds(pid, primary_height)?;
+    let frames: Vec<ScreenRect> = (0..screens.count())
+        .map(|index| screen_rect(screens.objectAtIndex(index).frame()))
+        .collect();
+    let index = screen_index_for_window(window, &frames)?;
+    Some(screens.objectAtIndex(index))
+}
+
+/// First on-screen layer-0 window of `pid`, in front-to-back order.
+/// Quartz bounds use the top-left of the primary display. `primary_height`
+/// is `NSScreen.screens[0]`, the menu-bar display, whose height is the flip axis.
+fn front_window_bounds(pid: i64, primary_height: f64) -> Option<ScreenRect> {
+    let info = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)?;
+    let layer_key = unsafe { kCGWindowLayer };
+    let pid_key = unsafe { kCGWindowOwnerPID };
+    let alpha_key = unsafe { kCGWindowAlpha };
+    let bounds_key = unsafe { kCGWindowBounds };
+    for index in 0..info.len() {
+        let Some(item) = info.get(index) else {
+            continue;
+        };
+        let dict = *item as CFDictionaryRef;
+        if dict.is_null() {
+            continue;
+        }
+        let Some(owner) = dict_i64(dict, pid_key) else {
+            continue;
+        };
+        let Some(layer) = dict_i64(dict, layer_key) else {
+            continue;
+        };
+        let alpha = dict_f64(dict, alpha_key).unwrap_or(1.0);
+        let Some(bounds) = window_cg_rect(dict, bounds_key) else {
+            continue;
+        };
+        if !is_focus_window(
+            owner,
+            pid,
+            layer,
+            alpha,
+            bounds.size.width as f64,
+            bounds.size.height as f64,
+        ) {
+            continue;
+        }
+        return Some(cg_window_to_appkit(
+            bounds.origin.x as f64,
+            bounds.origin.y as f64,
+            bounds.size.width as f64,
+            bounds.size.height as f64,
+            primary_height,
+        ));
+    }
+    None
+}
+
+fn dict_number(dict: CFDictionaryRef, key: CFStringRef) -> Option<CFNumber> {
+    let value = unsafe { CFDictionaryGetValue(dict, key as *const std::ffi::c_void) };
+    if value.is_null() {
+        return None;
+    }
+    unsafe { CFType::wrap_under_get_rule(value) }.downcast()
+}
+
+fn dict_i64(dict: CFDictionaryRef, key: CFStringRef) -> Option<i64> {
+    let number = dict_number(dict, key)?;
+    number
+        .to_i64()
+        .or_else(|| number.to_f64().map(|value| value as i64))
+}
+
+fn dict_f64(dict: CFDictionaryRef, key: CFStringRef) -> Option<f64> {
+    let number = dict_number(dict, key)?;
+    number
+        .to_f64()
+        .or_else(|| number.to_i64().map(|value| value as f64))
+}
+
+fn window_cg_rect(dict: CFDictionaryRef, key: CFStringRef) -> Option<CGRect> {
+    let value = unsafe { CFDictionaryGetValue(dict, key as *const std::ffi::c_void) };
+    if value.is_null() {
+        return None;
+    }
+    let bounds = unsafe { CFType::wrap_under_get_rule(value) }.downcast_into::<CFDictionary>()?;
+    CGRect::from_dict_representation(&bounds)
+}
+
+/// Bottom-left of a pill of `pill` size on `screen`.
+/// A saved drag is a fraction across its old visible frame and an inset from
+/// that frame's bottom, then clamped onto this screen.
+fn origin_for_screen(mtm: MainThreadMarker, screen: &NSScreen, pill: (f64, f64)) -> NSPoint {
+    let visible = screen_rect(screen.visibleFrame());
+    let point = if let Some(saved) = load_origin() {
+        if let Some(home) = screen_containing(mtm, saved) {
+            let from = screen_rect(home.visibleFrame());
+            map_origin((saved.x, saved.y), from, visible, pill)
+        } else {
+            bottom_center(visible, pill)
+        }
+    } else {
+        bottom_center(visible, pill)
+    };
+    NSPoint::new(point.0, point.1)
+}
+
+/// AppKit rectangle: origin is the bottom-left, y grows upward.
+#[derive(Clone, Copy, Debug)]
+struct ScreenRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn screen_rect(rect: NSRect) -> ScreenRect {
+    ScreenRect {
+        x: rect.origin.x,
+        y: rect.origin.y,
+        width: rect.size.width,
+        height: rect.size.height,
+    }
+}
+
+/// Quartz window bounds are top-left of the primary display, y downward.
+fn cg_window_to_appkit(x: f64, y: f64, width: f64, height: f64, primary_height: f64) -> ScreenRect {
+    ScreenRect {
+        x,
+        y: primary_height - (y + height),
+        width,
+        height,
+    }
+}
+
+fn intersection_area(a: ScreenRect, b: ScreenRect) -> f64 {
+    let left = a.x.max(b.x);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = a.y.max(b.y);
+    let top = (a.y + a.height).min(b.y + b.height);
+    (right - left).max(0.0) * (top - bottom).max(0.0)
+}
+
+fn screen_index_for_window(window: ScreenRect, screens: &[ScreenRect]) -> Option<usize> {
+    let mut best_index = None;
+    let mut best_area = 0.0;
+    for (index, screen) in screens.iter().enumerate() {
+        let area = intersection_area(window, *screen);
+        if area > best_area {
+            best_area = area;
+            best_index = Some(index);
         }
     }
-    let visible = screen.visibleFrame();
-    NSPoint::new(
-        visible.origin.x + (visible.size.width - WIDTH_RECORDING) / 2.0,
-        visible.origin.y + MARGIN,
+    best_index
+}
+
+const MIN_FOCUS_W: f64 = 40.0;
+const MIN_FOCUS_H: f64 = 20.0;
+
+fn is_focus_window(owner: i64, pid: i64, layer: i64, alpha: f64, width: f64, height: f64) -> bool {
+    owner == pid
+        && layer == 0
+        && alpha > 0.05
+        && width >= MIN_FOCUS_W
+        && height >= MIN_FOCUS_H
+        && width.is_finite()
+        && height.is_finite()
+}
+
+fn map_origin(saved: (f64, f64), from: ScreenRect, to: ScreenRect, pill: (f64, f64)) -> (f64, f64) {
+    let frac_x = if from.width > 1.0 {
+        (saved.0 - from.x) / from.width
+    } else {
+        0.5
+    };
+    let inset_y = saved.1 - from.y;
+    clamp_origin(to.x + frac_x * to.width, to.y + inset_y, to, pill)
+}
+
+fn bottom_center(visible: ScreenRect, pill: (f64, f64)) -> (f64, f64) {
+    clamp_origin(
+        visible.x + (visible.width - pill.0) / 2.0,
+        visible.y + MARGIN,
+        visible,
+        pill,
     )
+}
+
+fn clamp_origin(x: f64, y: f64, visible: ScreenRect, pill: (f64, f64)) -> (f64, f64) {
+    let max_x = (visible.x + visible.width - pill.0).max(visible.x);
+    let max_y = (visible.y + visible.height - pill.1).max(visible.y);
+    (x.clamp(visible.x, max_x), y.clamp(visible.y, max_y))
 }
 
 fn screen_containing(mtm: MainThreadMarker, point: NSPoint) -> Option<Retained<NSScreen>> {
@@ -982,7 +1209,11 @@ fn parse_number(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{audio_scale, height_share, unit_bezier, voice_target, wave_mul};
+    use super::{
+        audio_scale, bottom_center, cg_window_to_appkit, height_share, is_focus_window,
+        map_origin, screen_index_for_window, unit_bezier, voice_target, wave_mul, ScreenRect,
+        MARGIN,
+    };
 
     #[test]
     fn outer_bar_height_share_is_fixed() {
@@ -1046,5 +1277,132 @@ mod tests {
         assert!((target - 1.0).abs() < 1e-6, "{target}");
         assert!((audio_scale(target) - 5.0).abs() < 1e-9);
         assert!((floor - -40.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cg_bounds_flip_against_the_primary_display() {
+        let frame = cg_window_to_appkit(40.0, 100.0, 200.0, 80.0, 1512.0);
+        assert!((frame.x - 40.0).abs() < 1e-9);
+        assert!((frame.y - (1512.0 - 180.0)).abs() < 1e-9);
+        assert!((frame.width - 200.0).abs() < 1e-9);
+        assert!((frame.height - 80.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn window_below_the_primary_lands_on_the_lower_screen() {
+        let window = cg_window_to_appkit(20.0, 900.0, 400.0, 300.0, 900.0);
+        let screens = [
+            ScreenRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            },
+            ScreenRect {
+                x: 0.0,
+                y: -1080.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+        ];
+        assert_eq!(screen_index_for_window(window, &screens), Some(1));
+    }
+
+    #[test]
+    fn spanned_window_belongs_to_the_screen_with_more_area() {
+        let window = ScreenRect {
+            x: 1400.0,
+            y: 0.0,
+            width: 400.0,
+            height: 100.0,
+        };
+        let screens = [
+            ScreenRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            },
+            ScreenRect {
+                x: 1440.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+        ];
+        assert_eq!(screen_index_for_window(window, &screens), Some(1));
+    }
+
+    #[test]
+    fn focus_window_skips_the_status_pill_and_tiny_windows() {
+        assert!(is_focus_window(10, 10, 0, 1.0, 800.0, 600.0));
+        assert!(!is_focus_window(10, 11, 0, 1.0, 800.0, 600.0));
+        assert!(!is_focus_window(10, 10, 25, 1.0, 73.0, 30.0));
+        assert!(!is_focus_window(10, 10, 0, 0.0, 800.0, 600.0));
+        assert!(!is_focus_window(10, 10, 0, 1.0, 8.0, 8.0));
+    }
+
+    #[test]
+    fn dragged_origin_keeps_its_fraction_and_bottom_inset() {
+        let from = ScreenRect {
+            x: 0.0,
+            y: 80.0,
+            width: 1440.0,
+            height: 800.0,
+        };
+        let to = ScreenRect {
+            x: 1440.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1050.0,
+        };
+        let (x, y) = map_origin((360.0, 120.0), from, to, (73.0, 30.0));
+        assert!((x - (1440.0 + 0.25 * 1920.0)).abs() < 1e-6, "{x}");
+        assert!((y - 40.0).abs() < 1e-6, "{y}");
+    }
+
+    #[test]
+    fn same_screen_mapping_is_the_saved_point() {
+        let frame = ScreenRect {
+            x: 100.0,
+            y: 40.0,
+            width: 1400.0,
+            height: 860.0,
+        };
+        let (x, y) = map_origin((400.0, 48.0), frame, frame, (73.0, 30.0));
+        assert!((x - 400.0).abs() < 1e-6);
+        assert!((y - 48.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mapped_origin_stays_inside_the_visible_frame() {
+        let from = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 3000.0,
+            height: 1800.0,
+        };
+        let to = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 500.0,
+        };
+        let (x, y) = map_origin((2900.0, 1700.0), from, to, (73.0, 30.0));
+        assert!(x >= 0.0 && x + 73.0 <= 800.0 + 1e-6, "{x}");
+        assert!(y >= 0.0 && y + 30.0 <= 500.0 + 1e-6, "{y}");
+    }
+
+    #[test]
+    fn bottom_center_uses_the_margin() {
+        let visible = ScreenRect {
+            x: 10.0,
+            y: 70.0,
+            width: 1440.0,
+            height: 800.0,
+        };
+        let (x, y) = bottom_center(visible, (73.0, 30.0));
+        assert!((x - (10.0 + (1440.0 - 73.0) / 2.0)).abs() < 1e-9);
+        assert!((y - (70.0 + MARGIN)).abs() < 1e-9);
     }
 }
