@@ -1,0 +1,11 @@
+[package]
+name = "globe-input"
+version = "0.1.0"
+edition = "2021"
+description = "Watch the Globe key and paste into the focused macOS app"
+publish = false
+
+[dependencies]
+arboard = "3"
+core-foundation = "0.10"
+core-graphics = { version = "0.24", features = ["link"] }

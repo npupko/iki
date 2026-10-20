@@ -1,0 +1,44 @@
+[package]
+name = "iki-bar"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Floating recording pill for Iki"
+
+[dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSAppearance",
+    "NSApplication",
+    "NSAttributedString",
+    "NSBezierPath",
+    "NSColor",
+    "NSEvent",
+    "NSFont",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSPanel",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSShadow",
+    "NSStringDrawing",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSArray",
+    "NSAttributedString",
+    "NSDate",
+    "NSDictionary",
+    "NSGeometry",
+    "NSObject",
+    "NSObjCRuntime",
+    "NSRunLoop",
+    "NSString",
+    "NSTimer",
+] }

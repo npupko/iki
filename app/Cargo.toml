@@ -1,0 +1,25 @@
+[package]
+name = "iki"
+version = "0.1.0"
+edition = "2021"
+description = "Hold the Globe key to dictate through Soniox"
+publish = false
+
+[dependencies]
+iki-bar = { path = "../crates/iki-bar" }
+globe-input = { path = "../crates/globe-input" }
+soniox-audio = { path = "../crates/soniox-audio" }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
