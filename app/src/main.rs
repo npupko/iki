@@ -1,5 +1,8 @@
 //! Hold the Globe key to dictate. Releasing it pastes the Soniox transcript.
 
+mod dashboard;
+mod history;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -70,6 +73,7 @@ fn install_status_item(
     }
 
     let menu = NSMenu::new(mtm);
+    dashboard::add_menu_item(&menu, mtm);
     let quit = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -227,6 +231,7 @@ async fn dictation_loop(
                     bar.set_phase(BarPhase::Hidden);
                     continue;
                 }
+                history::record(text);
                 match globe_input::paste_text(text) {
                     Ok(()) => {
                         bar.set_phase(BarPhase::Hidden);

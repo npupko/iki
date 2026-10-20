@@ -10,16 +10,44 @@ iki-bar = { path = "../crates/iki-bar" }
 globe-input = { path = "../crates/globe-input" }
 soniox-audio = { path = "../crates/soniox-audio" }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = [
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
     "NSApplication",
+    "NSAttributedString",
+    "NSBezierPath",
     "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSGraphics",
     "NSMenu",
     "NSMenuItem",
+    "NSParagraphStyle",
+    "NSPasteboard",
+    "NSResponder",
     "NSRunningApplication",
+    "NSScreen",
+    "NSScrollView",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
-    "objc2-core-foundation",
+    "NSStringDrawing",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
 ] }
-objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSAttributedString",
+    "NSCalendar",
+    "NSDate",
+    "NSDateFormatter",
+    "NSDictionary",
+    "NSFormatter",
+    "NSGeometry",
+    "NSNotification",
+    "NSString",
+] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
