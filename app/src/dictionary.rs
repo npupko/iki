@@ -14,25 +14,21 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::storage::{app_support_file, now_ms, set_aside_unreadable, write_atomic};
+
 const MAX_CHARS: usize = 60;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Sort {
+    #[default]
     Newest,
     Oldest,
     StarredFirst,
     Alphabetical,
-}
-
-impl Default for Sort {
-    fn default() -> Self {
-        Self::Newest
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +87,9 @@ struct StoredEntry {
     replacement: Option<String>,
     #[serde(default)]
     starred: bool,
+    #[serde(default)]
     created_ms: u64,
+    #[serde(default)]
     modified_ms: u64,
     #[serde(default)]
     frequency_used: u32,
@@ -122,14 +120,22 @@ pub fn set_sort(sort: Sort) {
     mutate(|store| store.sort = sort);
 }
 
-pub fn count() -> usize {
-    with_lock(|| read_store(&dict_path()).entries.len())
-}
-
-pub fn visible(query: &str) -> Vec<Entry> {
+/// Total entry count and the entries matching `query`, from one read.
+pub fn listing(query: &str) -> (usize, Vec<Entry>) {
     with_lock(|| {
         let store = read_store(&dict_path());
-        store.visible(query)
+        (store.entries.len(), store.visible(query))
+    })
+}
+
+pub fn find(phrase: &str) -> Option<Entry> {
+    with_lock(|| {
+        let store = read_store(&dict_path());
+        store
+            .entries
+            .iter()
+            .find(|entry| entry.phrase == phrase)
+            .cloned()
     })
 }
 
@@ -145,18 +151,14 @@ pub fn update(original: &str, phrase: &str, replacement: Option<&str>) -> Result
     mutate_result(|store| store.update(original, phrase, replacement))
 }
 
-pub fn remove(phrase: &str) -> bool {
-    let mut removed = false;
+pub fn remove(phrase: &str) {
     mutate(|store| {
-        removed = store.remove(phrase);
+        store.remove(phrase);
     });
-    removed
 }
 
-pub fn set_starred(phrase: &str, starred: bool) {
-    mutate(|store| {
-        store.set_starred(phrase, starred);
-    });
+pub fn toggle_starred(phrase: &str) {
+    mutate(|store| store.toggle_starred(phrase));
 }
 
 /// Spellings to send as Soniox `context.terms`, starred first.
@@ -168,30 +170,24 @@ pub fn recognition_terms() -> Vec<String> {
     with_lock(|| read_store(&dict_path()).recognition_terms())
 }
 
-pub fn apply(text: &str) -> String {
-    with_lock(|| read_store(&dict_path()).apply(text))
-}
-
-pub fn note_uses(text: &str) {
+/// Count dictionary uses in a finished transcript, then return it with the
+/// corrections applied. One read, and one write only when a count changed.
+pub fn process_transcript(text: &str) -> String {
     with_lock(|| {
         let path = dict_path();
+        // An unreadable file yields no entries, so nothing is counted or written.
         let mut store = read_store(&path);
-        if !store.note_uses(text) {
-            return;
+        if store.note_uses(text) {
+            if let Err(error) = write_store(&path, &store) {
+                eprintln!("iki dictionary: {error}");
+            }
         }
-        if let Err(error) = write_store(&path, &store) {
-            eprintln!("iki dictionary: {error}");
-        }
-    });
+        store.apply(text)
+    })
 }
 
 fn dict_path() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Iki")
-        .join("dictionary.json")
+    app_support_file("dictionary.json")
 }
 
 fn with_lock<T>(body: impl FnOnce() -> T) -> T {
@@ -210,7 +206,7 @@ fn mutate(body: impl FnOnce(&mut Store)) {
 fn mutate_result<T>(body: impl FnOnce(&mut Store) -> Result<T, DictError>) -> Result<T, DictError> {
     with_lock(|| {
         let path = dict_path();
-        let mut store = read_store(&path);
+        let mut store = read_store_for_write(&path);
         let result = body(&mut store)?;
         if let Err(error) = write_store(&path, &store) {
             eprintln!("iki dictionary: {error}");
@@ -220,15 +216,29 @@ fn mutate_result<T>(body: impl FnOnce(&mut Store) -> Result<T, DictError>) -> Re
 }
 
 fn read_store(path: &Path) -> Store {
+    load_store(path).unwrap_or_else(|Unreadable| Store::empty())
+}
+
+/// Like [`read_store`], but a file that exists and cannot be parsed is set
+/// aside first, so the write that follows cannot erase the user's words.
+fn read_store_for_write(path: &Path) -> Store {
+    load_store(path).unwrap_or_else(|Unreadable| {
+        set_aside_unreadable(path);
+        Store::empty()
+    })
+}
+
+struct Unreadable;
+
+fn load_store(path: &Path) -> Result<Store, Unreadable> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(_) => return Store::empty(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Store::empty()),
+        Err(_) => return Err(Unreadable),
     };
-    let Ok(text) = String::from_utf8(bytes) else {
-        return Store::empty();
-    };
+    let text = String::from_utf8(bytes).map_err(|_| Unreadable)?;
     if text.trim().is_empty() {
-        return Store::empty();
+        return Ok(Store::empty());
     }
     serde_json::from_str::<FileShape>(&text)
         .map(|file| Store {
@@ -261,15 +271,10 @@ fn read_store(path: &Path) -> Store {
                 })
                 .collect(),
         })
-        .unwrap_or_else(|_| Store::empty())
+        .map_err(|_| Unreadable)
 }
 
 fn write_store(path: &Path, store: &Store) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
     let shape = FileShape {
         sort: store.sort,
         entries: store
@@ -288,16 +293,7 @@ fn write_store(path: &Path, store: &Store) -> io::Result<()> {
     };
     let bytes = serde_json::to_vec_pretty(&shape)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let tmp = tmp_path(path);
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
+    write_atomic(path, &bytes)
 }
 
 impl Store {
@@ -357,17 +353,16 @@ impl Store {
         Ok(())
     }
 
-    fn remove(&mut self, phrase: &str) -> bool {
-        let Some(index) = self.find(phrase) else {
-            return false;
-        };
-        self.entries.remove(index);
-        true
+    fn remove(&mut self, phrase: &str) {
+        if let Some(index) = self.find(phrase) {
+            self.entries.remove(index);
+        }
     }
 
-    fn set_starred(&mut self, phrase: &str, starred: bool) {
+    fn toggle_starred(&mut self, phrase: &str) {
         if let Some(index) = self.find(phrase) {
-            self.entries[index].starred = starred;
+            let entry = &mut self.entries[index];
+            entry.starred = !entry.starred;
         }
     }
 
@@ -516,6 +511,8 @@ impl Store {
         out
     }
 
+    /// A correction also counts its spelling. That spelling is sent to Soniox
+    /// as a term, so the misspelling alone stops showing up once it works.
     fn note_uses(&mut self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
         let now = now_ms();
@@ -525,7 +522,13 @@ impl Store {
             if phrase.is_empty() {
                 continue;
             }
-            let count = count_matches(&chars, &phrase);
+            let mut count = count_matches(&chars, &phrase);
+            if let Some(replacement) = &entry.replacement {
+                let spelling: Vec<char> = replacement.chars().collect();
+                if !spelling.is_empty() && case_fold(&spelling) != case_fold(&phrase) {
+                    count = count.saturating_add(count_matches(&chars, &spelling));
+                }
+            }
             if count == 0 {
                 continue;
             }
@@ -601,13 +604,6 @@ fn is_edge_space(c: char) -> bool {
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
     )
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 fn case_fold(chars: &[char]) -> String {
@@ -762,11 +758,63 @@ mod tests {
     }
 
     #[test]
+    fn a_correction_counts_its_spelling_too() {
+        let mut store = Store::empty();
+        store.entries.push(entry("teh", Some("the"), false, 0));
+        store.entries.push(entry("soniox", Some("Soniox"), false, 0));
+        assert!(store.note_uses("the cat and teh dog"));
+        assert_eq!(store.entries[0].frequency_used, 2);
+        assert!(store.note_uses("Soniox"));
+        assert_eq!(store.entries[1].frequency_used, 1);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_set_aside_before_a_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "iki-dictionary-bad-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dictionary.json");
+        fs::write(&path, br#"{"entries":[{"phrase":"Soniox","sort":"most_used"}],"sort":"most_used"}"#)
+            .unwrap();
+        assert!(read_store(&path).entries.is_empty());
+        assert!(path.exists(), "a plain read must not move the file");
+        let store = read_store_for_write(&path);
+        assert!(store.entries.is_empty());
+        let kept: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!kept.iter().any(|name| name == "dictionary.json"));
+        assert!(kept
+            .iter()
+            .any(|name| name.starts_with("dictionary.json.unreadable-")));
+    }
+
+    #[test]
+    fn entries_without_timestamps_still_load() {
+        let path = std::env::temp_dir().join(format!(
+            "iki-dictionary-old-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, br#"{"entries":[{"phrase":"Soniox"}]}"#).unwrap();
+        let loaded = read_store(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].phrase, "Soniox");
+    }
+
+    #[test]
     fn search_sort_and_file_round_trip() {
         let mut store = Store::empty();
         store.add_word("beta").unwrap();
         store.add_correction("alfa miss", "Alfa").unwrap();
-        store.set_starred("beta", true);
+        store.toggle_starred("beta");
         store.sort = Sort::Alphabetical;
         let shown = store.visible("alfa");
         assert_eq!(shown.len(), 1);

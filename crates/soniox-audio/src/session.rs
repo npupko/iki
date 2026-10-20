@@ -313,18 +313,24 @@ fn limit_languages(languages: &[String]) -> Vec<String> {
 
 /// Keep earlier terms and skip any later term that would push the serialized
 /// `context` object past [`CONTEXT_CHAR_BUDGET`].
+/// The length is kept as a running sum (the empty object plus each encoded
+/// term and its comma), so each term is serialized once.
 fn limit_terms(terms: &[String]) -> Vec<String> {
-    let mut kept: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut len = context_object_len(&[]);
     for term in terms {
         if term.is_empty() {
             continue;
         }
-        kept.push(term);
-        if context_object_len(&kept) > CONTEXT_CHAR_BUDGET {
-            kept.pop();
+        let item = serde_json::Value::from(term.as_str()).to_string().len()
+            + usize::from(!kept.is_empty());
+        if len + item > CONTEXT_CHAR_BUDGET {
+            continue;
         }
+        len += item;
+        kept.push(term.clone());
     }
-    kept.into_iter().map(str::to_string).collect()
+    kept
 }
 
 fn context_object_len(terms: &[&str]) -> usize {
@@ -413,5 +419,25 @@ mod tests {
         let sent = value["context"]["terms"].as_array().unwrap();
         assert_eq!(sent.len(), kept.len());
         assert!(serde_json::json!({ "terms": sent }).to_string().len() <= CONTEXT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn running_length_matches_reserializing_every_time() {
+        let terms: Vec<String> = (0..900)
+            .map(|index| match index % 4 {
+                0 => format!("say \"hi\" {index}"),
+                1 => format!("Привет-{index}"),
+                2 => format!("back\\slash\t{index}"),
+                _ => "x".repeat(index % 50 + 1),
+            })
+            .collect();
+        let mut oracle: Vec<&str> = Vec::new();
+        for term in &terms {
+            oracle.push(term);
+            if context_object_len(&oracle) > CONTEXT_CHAR_BUDGET {
+                oracle.pop();
+            }
+        }
+        assert_eq!(limit_terms(&terms), oracle);
     }
 }

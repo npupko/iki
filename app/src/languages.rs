@@ -13,6 +13,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::storage::{app_support_file, set_aside_unreadable, write_atomic};
+
 /// Soniox real-time languages, ISO 639-1 codes, in the documented list order.
 const CATALOG: &[(&str, &str)] = &[
     ("af", "Afrikaans"),
@@ -204,12 +206,7 @@ fn normalize(codes: Vec<String>) -> Vec<String> {
 }
 
 fn languages_path() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Iki")
-        .join("languages.json")
+    app_support_file("languages.json")
 }
 
 fn with_lock<T>(body: impl FnOnce() -> T) -> T {
@@ -230,7 +227,10 @@ fn mutate_result<T>(
 ) -> Result<T, LanguageError> {
     with_lock(|| {
         let path = languages_path();
-        let mut store = read_store(&path);
+        let mut store = load_store(&path).unwrap_or_else(|Unreadable| {
+            set_aside_unreadable(&path);
+            Store::english()
+        });
         let result = body(&mut store)?;
         if let Err(error) = write_store(&path, &store) {
             eprintln!("iki languages: {error}");
@@ -240,43 +240,34 @@ fn mutate_result<T>(
 }
 
 fn read_store(path: &Path) -> Store {
+    load_store(path).unwrap_or_else(|Unreadable| Store::english())
+}
+
+struct Unreadable;
+
+fn load_store(path: &Path) -> Result<Store, Unreadable> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(_) => return Store::english(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Store::english()),
+        Err(_) => return Err(Unreadable),
     };
-    let Ok(text) = String::from_utf8(bytes) else {
-        return Store::english();
-    };
+    let text = String::from_utf8(bytes).map_err(|_| Unreadable)?;
     if text.trim().is_empty() {
-        return Store::english();
+        return Ok(Store::english());
     }
     serde_json::from_str::<FileShape>(&text)
         .map(|file| Store {
             codes: normalize(file.codes),
         })
-        .unwrap_or_else(|_| Store::english())
+        .map_err(|_| Unreadable)
 }
 
 fn write_store(path: &Path, store: &Store) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
     let bytes = serde_json::to_vec_pretty(&FileShape {
         codes: store.codes.clone(),
     })
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let tmp = tmp_path(path);
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
+    write_atomic(path, &bytes)
 }
 
 #[cfg(test)]

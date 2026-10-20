@@ -3,10 +3,10 @@
 //! Stored at `~/Library/Application Support/Iki/history.json`.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::storage::{app_support_file, now_ms, write_atomic};
 
 const MAX_ENTRIES: usize = 500;
 
@@ -31,12 +31,7 @@ pub fn stats(entries: &[Entry]) -> (usize, usize) {
 }
 
 fn history_path() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Iki")
-        .join("history.json")
+    app_support_file("history.json")
 }
 
 fn record_to(path: &Path, text: &str) {
@@ -53,7 +48,7 @@ fn record_to(path: &Path, text: &str) {
             let extra = entries.len() - MAX_ENTRIES;
             entries.drain(0..extra);
         }
-        if let Err(error) = write_entries(path, &entries) {
+        if let Err(error) = write_atomic(path, encode(&entries).as_bytes()) {
             eprintln!("iki history: {error}");
         }
     });
@@ -67,13 +62,6 @@ fn with_lock<T>(body: impl FnOnce() -> T) -> T {
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     body()
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 fn word_count(text: &str) -> usize {
@@ -92,24 +80,6 @@ fn read_entries(path: &Path) -> Vec<Entry> {
         return Vec::new();
     }
     parse_entries(&text).unwrap_or_default()
-}
-
-fn write_entries(path: &Path, entries: &[Entry]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let tmp = tmp_path(path);
-    fs::write(&tmp, encode(entries))?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
 }
 
 fn encode(entries: &[Entry]) -> String {
@@ -354,6 +324,7 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempHist {
         path: PathBuf,

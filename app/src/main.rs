@@ -5,6 +5,7 @@ mod dictionary;
 mod dictionary_ui;
 mod history;
 mod languages;
+mod storage;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -27,6 +28,7 @@ fn main() {
     let mtm = MainThreadMarker::new().expect("Iki must start on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    install_edit_menu(&app, mtm);
     let _status = install_status_item(&app, mtm);
 
     let bar = BarController::install().unwrap_or_else(|error| {
@@ -97,6 +99,36 @@ fn install_status_item(
     status
 }
 
+/// The app has no visible menu bar, but its main menu still supplies the
+/// Cmd-X/C/V/A/Z key equivalents that text fields rely on.
+fn install_edit_menu(app: &NSApplication, mtm: MainThreadMarker) {
+    let main_menu = NSMenu::new(mtm);
+    main_menu.addItem(&NSMenuItem::new(mtm));
+    let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
+    for (title, action, key) in [
+        ("Undo", sel!(undo:), "z"),
+        ("Redo", sel!(redo:), "Z"),
+        ("Cut", sel!(cut:), "x"),
+        ("Copy", sel!(copy:), "c"),
+        ("Paste", sel!(paste:), "v"),
+        ("Select All", sel!(selectAll:), "a"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        edit.addItem(&item);
+    }
+    let edit_item = NSMenuItem::new(mtm);
+    edit_item.setSubmenu(Some(&edit));
+    main_menu.addItem(&edit_item);
+    app.setMainMenu(Some(&main_menu));
+}
+
 fn load_api_key() -> String {
     if let Ok(key) = std::env::var("SONIOX_API_KEY") {
         let key = key.trim().to_string();
@@ -157,8 +189,7 @@ fn fnox_binary() -> Option<PathBuf> {
 }
 
 fn key_file() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join("Library/Application Support/Iki/soniox_api_key")
+    storage::app_support_file("soniox_api_key")
 }
 
 async fn dictation_loop(
@@ -247,8 +278,7 @@ async fn dictation_loop(
                     bar.set_phase(BarPhase::Hidden);
                     continue;
                 }
-                dictionary::note_uses(original);
-                let text = dictionary::apply(original);
+                let text = dictionary::process_transcript(original);
                 history::record(&text);
                 match globe_input::paste_text(&text) {
                     Ok(()) => {
@@ -278,6 +308,11 @@ fn notice_for_dictation(error: &DictationError) -> Option<Notice> {
             title: "Microphone isn't available".into(),
             body: "Check that it's connected, and that Iki is allowed to use it.".into(),
         },
+        // The key travels in the handshake header, so a rejected key fails
+        // the upgrade (HTTP 401/403) and arrives here as a network error.
+        DictationError::Network(detail) if is_auth_failure(&detail.to_ascii_lowercase()) => {
+            rejected_key_notice()
+        }
         DictationError::Network(_) => Notice {
             title: "Can't reach Soniox".into(),
             body: "Check your connection and try again.".into(),
@@ -300,10 +335,7 @@ fn protocol_notice(detail: &str) -> Notice {
             body: "Star the names you use most, then try again.".into(),
         }
     } else if is_auth_failure(&lower) {
-        Notice {
-            title: "Soniox rejected the key".into(),
-            body: "Check SONIOX_API_KEY, or the key in Application Support, then relaunch.".into(),
-        }
+        rejected_key_notice()
     } else {
         Notice {
             title: "Transcription didn't finish".into(),
@@ -317,8 +349,18 @@ fn is_auth_failure(detail: &str) -> bool {
         || detail.contains("api_key")
         || detail.contains("unauthorized")
         || detail.contains("authentication")
-        || detail.contains("401")
         || detail.contains("forbidden")
+        // A status code, not any number that contains the digits (`4013`, `14012 tokens`).
+        || detail
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|number| number == "401" || number == "403")
+}
+
+fn rejected_key_notice() -> Notice {
+    Notice {
+        title: "Soniox rejected the key".into(),
+        body: "Check SONIOX_API_KEY, or the key in Application Support, then relaunch.".into(),
+    }
 }
 
 fn notice_for_input(error: &globe_input::InputError) -> Notice {
@@ -453,6 +495,29 @@ mod tests {
         .expect("shown");
         assert_eq!(notice.title, "Soniox rejected the key");
         assert!(!notice.body.to_ascii_lowercase().contains("authentication"));
+    }
+
+    #[test]
+    fn a_rejected_handshake_is_a_key_problem_not_a_connection_problem() {
+        let notice = notice_for_dictation(&DictationError::Network(
+            "HTTP error: 401 Unauthorized".into(),
+        ))
+        .expect("shown");
+        assert_eq!(notice.title, "Soniox rejected the key");
+        let notice = notice_for_dictation(&DictationError::Network(
+            "IO error: Connection reset by peer".into(),
+        ))
+        .expect("shown");
+        assert_eq!(notice.title, "Can't reach Soniox");
+    }
+
+    #[test]
+    fn a_number_containing_401_is_not_an_auth_failure() {
+        let notice = notice_for_dictation(&DictationError::Protocol(
+            "internal_error: Cannot continue request (code 4013)".into(),
+        ))
+        .expect("shown");
+        assert_eq!(notice.title, "Transcription didn't finish");
     }
 
     #[test]

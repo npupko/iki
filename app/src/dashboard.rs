@@ -554,7 +554,11 @@ fn paint_block(
     }
 }
 
-fn draw_string(text: &str, rect: NSRect, attrs: &NSDictionary<NSAttributedStringKey, AnyObject>) {
+pub(crate) fn draw_string(
+    text: &str,
+    rect: NSRect,
+    attrs: &NSDictionary<NSAttributedStringKey, AnyObject>,
+) {
     let string = NSString::from_str(text);
     unsafe {
         string.drawWithRect_options_attributes_context(
@@ -588,8 +592,16 @@ fn text_attrs(
     font: &NSFont,
     color: &NSColor,
 ) -> Retained<NSDictionary<NSAttributedStringKey, AnyObject>> {
+    text_attrs_with(font, color, NSLineBreakMode::ByWordWrapping)
+}
+
+pub(crate) fn text_attrs_with(
+    font: &NSFont,
+    color: &NSColor,
+    mode: NSLineBreakMode,
+) -> Retained<NSDictionary<NSAttributedStringKey, AnyObject>> {
     let paragraph = NSMutableParagraphStyle::new();
-    paragraph.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    paragraph.setLineBreakMode(mode);
     let font_key = unsafe { NSFontAttributeName };
     let color_key = unsafe { NSForegroundColorAttributeName };
     let style_key = unsafe { NSParagraphStyleAttributeName };

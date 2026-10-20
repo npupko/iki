@@ -3,25 +3,20 @@
 use std::cell::{Cell, OnceCell, RefCell};
 
 use objc2::ffi::NSInteger;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSBackingStoreType, NSBezelStyle,
     NSBezierPath, NSBorderType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSLineBreakMode, NSMenu, NSMenuItem, NSMutableParagraphStyle,
-    NSParagraphStyleAttributeName, NSPopUpButton, NSResponder, NSScrollView,
-    NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTextField, NSTextFieldDelegate,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont, NSLineBreakMode, NSMenu,
+    NSMenuItem, NSPopUpButton, NSResponder, NSScrollView, NSTextField, NSTextFieldDelegate,
     NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
-use objc2_foundation::{
-    NSAttributedStringKey, NSDictionary, NSEdgeInsets, NSNotification, NSPoint, NSRect, NSSize,
-    NSString,
-};
+use objc2_foundation::{NSEdgeInsets, NSNotification, NSPoint, NSRect, NSSize, NSString};
 
-use crate::dashboard;
-use crate::dictionary::{self, Entry, Sort};
+use crate::dashboard::{self, draw_string, text_attrs_with};
+use crate::dictionary::{self, Sort};
 use crate::languages;
 
 const WINDOW_W: f64 = 720.0;
@@ -64,8 +59,8 @@ struct ListIvars {
     query_empty: Cell<bool>,
     press: Cell<Option<NSPoint>>,
     width: Cell<f64>,
-    /// Shell that owns this list. Main thread only; valid for the window lifetime.
-    host: Cell<usize>,
+    /// Shell that owns this list.
+    host: OnceCell<Weak<DictionaryShell>>,
 }
 
 struct Listed {
@@ -120,19 +115,13 @@ impl DictionaryWindow {
         language_scroll.setDocumentView(Some(&*language_rows));
 
         let vocabulary_label = section_label("Vocabulary", mtm);
-        let search = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
-        search.setPlaceholderString(Some(&NSString::from_str("Search your vocabulary")));
-        search.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        let search = entry_field("Search your vocabulary", mtm);
         let sort_popup = popup(mtm);
         for title in ["Newest", "Oldest", "Starred first", "Alphabetical"] {
             sort_popup.addItemWithTitle(&NSString::from_str(title));
         }
-        let word = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
-        word.setPlaceholderString(Some(&NSString::from_str("Add a new word")));
-        word.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-        let spelling = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
-        spelling.setPlaceholderString(Some(&NSString::from_str("Correct spelling")));
-        spelling.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        let word = entry_field("Add a new word", mtm);
+        let spelling = entry_field("Correct spelling", mtm);
         spelling.setHidden(true);
 
         let correction = NSButton::initWithFrame(NSButton::alloc(mtm), NSRect::ZERO);
@@ -198,7 +187,7 @@ impl DictionaryWindow {
         ivars.error.set(error).ok();
         ivars.scroll.set(scroll).ok();
         ivars.list.set(list.clone()).ok();
-        list.set_host(&*shell as *const DictionaryShell as usize);
+        list.set_host(&shell);
 
         wire(
             &*shell,
@@ -268,6 +257,18 @@ fn wire(
         language_add.setTarget(Some(shell));
         language_add.setAction(Some(sel!(addLanguage:)));
     }
+}
+
+/// An editable field whose action fires on Return only. AppKit's default also
+/// fires it when the field loses focus, which would submit a half-filled form.
+fn entry_field(placeholder: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
+    let field = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
+    field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+    field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+    if let Some(cell) = field.cell() {
+        cell.setSendsActionOnEndEditing(false);
+    }
+    field
 }
 
 fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
@@ -347,7 +348,7 @@ define_class!(
 
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, _notification: &NSNotification) {
-            self.layout_children();
+            self.layout(false);
         }
 
         #[unsafe(method(windowDidBecomeKey:))]
@@ -584,8 +585,7 @@ impl DictionaryShell {
     fn reload_list(&self) {
         let query = self.search().stringValue().to_string();
         let query_empty = query.trim().is_empty();
-        let total = dictionary::count();
-        let entries = dictionary::visible(&query);
+        let (total, entries) = dictionary::listing(&query);
         let line = if query_empty {
             count_line(total)
         } else {
@@ -619,6 +619,12 @@ impl DictionaryShell {
     }
 
     fn layout_children(&self) {
+        self.layout(true);
+    }
+
+    /// `reload` re-reads the language and vocabulary files. A resize only
+    /// moves frames, so it reuses what is already shown.
+    fn layout(&self, reload: bool) {
         if self.ivars().stats.get().is_none() {
             return;
         }
@@ -640,7 +646,12 @@ impl DictionaryShell {
             .setFrame(rect(PAD + inner - add_w, y, add_w, 26.0));
         y += 34.0;
 
-        let codes = languages::codes();
+        let shown = self.ivars().shown_codes.borrow().clone();
+        let codes = if reload || shown.is_empty() {
+            languages::codes()
+        } else {
+            shown
+        };
         let list_h = ((codes.len().max(1) as f64) * LANG_ROW_H).min(112.0);
         self.language_scroll().setFrame(rect(PAD, y, inner, list_h));
         let mut language_w = self.language_scroll().contentSize().width;
@@ -693,7 +704,11 @@ impl DictionaryShell {
 
         let scroll_h = (bounds.size.height - y).max(0.0);
         self.scroll().setFrame(rect(0.0, y, width, scroll_h));
-        self.reload_list();
+        if reload {
+            self.reload_list();
+        } else {
+            self.layout_list();
+        }
         self.setNeedsDisplay(true);
     }
 
@@ -826,7 +841,7 @@ impl DictionaryShell {
     }
 
     fn begin_edit(&self, phrase: &str) {
-        let Some(entry) = find_entry(phrase) else {
+        let Some(entry) = dictionary::find(phrase) else {
             self.refresh();
             return;
         };
@@ -846,8 +861,7 @@ impl DictionaryShell {
     }
 
     fn toggle_star(&self, phrase: &str) {
-        let starred = find_entry(phrase).is_some_and(|entry| entry.starred);
-        dictionary::set_starred(phrase, !starred);
+        dictionary::toggle_starred(phrase);
         self.reload_list();
     }
 
@@ -862,12 +876,6 @@ impl DictionaryShell {
     fn set_error(&self, message: &str) {
         self.error().setStringValue(&NSString::from_str(message));
     }
-}
-
-fn find_entry(phrase: &str) -> Option<Entry> {
-    dictionary::visible("")
-        .into_iter()
-        .find(|entry| entry.phrase == phrase)
 }
 
 fn confirm_delete(phrase: &str, mtm: MainThreadMarker) -> bool {
@@ -991,8 +999,9 @@ define_class!(
             let body = NSFont::systemFontOfSize(13.0);
             let label = NSColor::labelColor();
             let secondary = NSColor::secondaryLabelColor();
-            let body_attrs = text_attrs(&body, &label, NSLineBreakMode::ByTruncatingTail);
-            let secondary_attrs = text_attrs(&body, &secondary, NSLineBreakMode::ByWordWrapping);
+            let body_attrs = text_attrs_with(&body, &label, NSLineBreakMode::ByTruncatingTail);
+            let secondary_attrs =
+                text_attrs_with(&body, &secondary, NSLineBreakMode::ByWordWrapping);
             let rows = self.ivars().rows.borrow();
             for row in rows.iter() {
                 if row.y + row.height < dirty.origin.y || row.y > dirty.origin.y + dirty.size.height {
@@ -1029,22 +1038,17 @@ impl DictionaryList {
             query_empty: Cell::new(true),
             press: Cell::new(None),
             width: Cell::new(-1.0),
-            host: Cell::new(0),
+            host: OnceCell::new(),
         });
         unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] }
     }
 
-    fn set_host(&self, host: usize) {
-        self.ivars().host.set(host);
+    fn set_host(&self, host: &Retained<DictionaryShell>) {
+        let _ = self.ivars().host.set(Weak::from_retained(host));
     }
 
-    fn host(&self) -> Option<&DictionaryShell> {
-        let ptr = self.ivars().host.get() as *const DictionaryShell;
-        if ptr.is_null() {
-            None
-        } else {
-            Some(unsafe { &*ptr })
-        }
+    fn host(&self) -> Option<Retained<DictionaryShell>> {
+        self.ivars().host.get()?.load()
     }
 
     fn set_listed(&self, listed: Vec<Listed>, query_empty: bool) {
@@ -1110,38 +1114,6 @@ impl DictionaryList {
             .map(|row| row.y + row.height + 12.0)
             .unwrap_or(16.0)
     }
-}
-
-fn draw_string(text: &str, rect: NSRect, attrs: &NSDictionary<NSAttributedStringKey, AnyObject>) {
-    let string = NSString::from_str(text);
-    unsafe {
-        string.drawWithRect_options_attributes_context(
-            rect,
-            NSStringDrawingOptions::UsesLineFragmentOrigin
-                | NSStringDrawingOptions::UsesFontLeading,
-            Some(attrs),
-            None,
-        );
-    }
-}
-
-fn text_attrs(
-    font: &NSFont,
-    color: &NSColor,
-    mode: NSLineBreakMode,
-) -> Retained<NSDictionary<NSAttributedStringKey, AnyObject>> {
-    let paragraph = NSMutableParagraphStyle::new();
-    paragraph.setLineBreakMode(mode);
-    let font_key = unsafe { NSFontAttributeName };
-    let color_key = unsafe { NSForegroundColorAttributeName };
-    let style_key = unsafe { NSParagraphStyleAttributeName };
-    let font_obj: &AnyObject = font;
-    let color_obj: &AnyObject = color;
-    let style_obj: &AnyObject = &*paragraph;
-    NSDictionary::from_slices(
-        &[font_key, color_key, style_key],
-        &[font_obj, color_obj, style_obj],
-    )
 }
 
 define_class!(

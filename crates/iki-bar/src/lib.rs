@@ -515,7 +515,9 @@ impl BarView {
         self.apply_size(width, height);
     }
 
-    /// Grows from the center. A drag in progress keeps the frame the pointer is holding.
+    /// Grows from the center, kept inside the screen's visible frame so a
+    /// notice card taller than the pill does not hang off the bottom edge.
+    /// A drag in progress keeps the frame the pointer is holding.
     fn apply_size(&self, width: f64, height: f64) {
         if self.ivars().drag.get().is_some() {
             return;
@@ -529,9 +531,14 @@ impl BarView {
         }
         let mid_x = frame.origin.x + frame.size.width / 2.0;
         let mid_y = frame.origin.y + frame.size.height / 2.0;
+        let mut origin = (mid_x - width / 2.0, mid_y - height / 2.0);
+        if let Some(screen) = window.screen() {
+            let visible = screen_rect(screen.visibleFrame());
+            origin = clamp_origin(origin.0, origin.1, visible, (width, height));
+        }
         window.setFrame_display(
             NSRect::new(
-                NSPoint::new(mid_x - width / 2.0, mid_y - height / 2.0),
+                NSPoint::new(origin.0, origin.1),
                 NSSize::new(width, height),
             ),
             true,
@@ -980,12 +987,13 @@ fn draw_line(text: &str, font: &NSFont, color: &NSColor, x: f64, row_bottom: f64
     if text.is_empty() {
         return;
     }
-    let baseline =
-        row_bottom + (NOTICE_LINE - (font.ascender() - font.descender())) / 2.0 - font.descender();
+    // `drawAtPoint` places the bottom of the line box, not the baseline, at
+    // this point in an unflipped view. Center that box in the row.
+    let box_bottom = row_bottom + (NOTICE_LINE - (font.ascender() - font.descender())) / 2.0;
     let attrs = text_attributes(font, Some(color));
     let string = NSString::from_str(text);
     unsafe {
-        string.drawAtPoint_withAttributes(NSPoint::new(x, baseline), Some(&attrs));
+        string.drawAtPoint_withAttributes(NSPoint::new(x, box_bottom), Some(&attrs));
     }
 }
 
