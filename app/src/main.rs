@@ -9,7 +9,7 @@ mod storage;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iki_bar::{BarPhase, BarController};
 use globe_input::{HoldEdge, HoldWatch};
@@ -22,6 +22,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSString;
 use soniox_audio::{DictationConfig, DictationError, DictationHandle};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 fn main() {
@@ -192,20 +193,54 @@ fn key_file() -> PathBuf {
     storage::app_support_file("soniox_api_key")
 }
 
-async fn dictation_loop(
-    mut rx: UnboundedReceiver<HoldEdge>,
-    bar: BarController,
-    api_key: String,
-) {
-    'hold: loop {
-        match rx.recv().await {
-            Some(HoldEdge::Down) => {}
-            Some(HoldEdge::Up) => continue,
-            None => return,
+/// A release sooner than this is a tap. It may have no audio at all, which
+/// Soniox rejects as "No audio received", so it ends the take silently.
+const MIN_HOLD: Duration = Duration::from_millis(250);
+
+/// Hold edges plus whether the key is down after the last one read.
+struct Keys {
+    rx: UnboundedReceiver<HoldEdge>,
+    held: bool,
+}
+
+impl Keys {
+    async fn recv(&mut self) -> Option<HoldEdge> {
+        let edge = self.rx.recv().await?;
+        self.held = edge == HoldEdge::Down;
+        Some(edge)
+    }
+
+    /// Drops the edges that queued while a take or notice was busy, keeping
+    /// only whether the key is still down. `false` once the tap is gone.
+    fn drain(&mut self) -> bool {
+        loop {
+            match self.rx.try_recv() {
+                Ok(edge) => self.held = edge == HoldEdge::Down,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
         }
+    }
+}
+
+async fn dictation_loop(rx: UnboundedReceiver<HoldEdge>, bar: BarController, api_key: String) {
+    let mut keys = Keys { rx, held: false };
+    'hold: loop {
+        // Presses made during the last take must not replay one by one.
+        if !keys.drain() {
+            return;
+        }
+        if !keys.held {
+            match keys.recv().await {
+                Some(HoldEdge::Down) => {}
+                Some(HoldEdge::Up) => continue,
+                None => return,
+            }
+        }
+        let pressed = Instant::now();
 
         if api_key.is_empty() {
-            show_notice(&bar, missing_key_notice()).await;
+            show_notice(&bar, missing_key_notice(), &mut keys).await;
             continue;
         }
 
@@ -218,12 +253,12 @@ async fn dictation_loop(
             languages: languages::codes(),
         });
         tokio::pin!(start);
-        let mut released = false;
+        let mut held_for = None;
         let handle = loop {
             tokio::select! {
                 started = &mut start => break started,
-                edge = rx.recv() => match edge {
-                    Some(HoldEdge::Up) => released = true,
+                edge = keys.recv() => match edge {
+                    Some(HoldEdge::Up) => held_for = Some(pressed.elapsed()),
                     Some(HoldEdge::Down) => {}
                     None => return,
                 },
@@ -233,13 +268,13 @@ async fn dictation_loop(
         let mut handle = match handle {
             Ok(handle) => handle,
             Err(error) => {
-                show_dictation_error(&bar, error).await;
+                show_dictation_error(&bar, error, &mut keys).await;
                 continue;
             }
         };
 
         // The mic is already playing. Read it now, instead of waiting for the socket.
-        if !released {
+        if held_for.is_none() {
             bar.set_phase(BarPhase::Recording {
                 level: handle.rms(),
             });
@@ -249,23 +284,32 @@ async fn dictation_loop(
                         if let Some(error) = handle.connect_error() {
                             let _ = handle.finish().await;
                             play_dictation("stop");
-                            show_dictation_error(&bar, error).await;
+                            show_dictation_error(&bar, error, &mut keys).await;
                             continue 'hold;
                         }
                         bar.set_phase(BarPhase::Recording { level: handle.rms() });
                     }
-                    edge = rx.recv() => match edge {
-                        Some(HoldEdge::Up) | None => break,
+                    edge = keys.recv() => match edge {
+                        Some(HoldEdge::Up) | None => {
+                            held_for = Some(pressed.elapsed());
+                            break;
+                        }
                         Some(HoldEdge::Down) => {}
                     },
                 }
             }
         }
 
+        if held_for.is_some_and(|held| held < MIN_HOLD) {
+            drop(handle);
+            bar.set_phase(BarPhase::Hidden);
+            continue;
+        }
+
         if let Some(error) = handle.connect_error() {
             let _ = handle.finish().await;
             play_dictation("stop");
-            show_dictation_error(&bar, error).await;
+            show_dictation_error(&bar, error, &mut keys).await;
             continue;
         }
 
@@ -286,11 +330,11 @@ async fn dictation_loop(
                     }
                     Err(error) => {
                         eprintln!("iki: {error}");
-                        show_notice(&bar, notice_for_input(&error)).await;
+                        show_notice(&bar, notice_for_input(&error), &mut keys).await;
                     }
                 }
             }
-            Err(error) => show_dictation_error(&bar, error).await,
+            Err(error) => show_dictation_error(&bar, error, &mut keys).await,
         }
     }
 }
@@ -387,22 +431,34 @@ fn missing_key_notice() -> Notice {
     }
 }
 
-async fn show_dictation_error(bar: &BarController, error: DictationError) {
+async fn show_dictation_error(bar: &BarController, error: DictationError, keys: &mut Keys) {
     match notice_for_dictation(&error) {
         Some(notice) => {
             eprintln!("iki: {error}");
-            show_notice(bar, notice).await;
+            show_notice(bar, notice, keys).await;
         }
         None => bar.set_phase(BarPhase::Hidden),
     }
 }
 
-async fn show_notice(bar: &BarController, notice: Notice) {
+/// Shows the notice for four seconds. Pressing the key dismisses it and
+/// starts the next take, since `keys` then reports the key as held.
+async fn show_notice(bar: &BarController, notice: Notice, keys: &mut Keys) {
     bar.set_phase(BarPhase::Error {
         title: notice.title,
         body: notice.body,
     });
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    let shown = tokio::time::sleep(Duration::from_secs(4));
+    tokio::pin!(shown);
+    loop {
+        tokio::select! {
+            _ = &mut shown => break,
+            edge = keys.recv() => match edge {
+                Some(HoldEdge::Down) | None => break,
+                Some(HoldEdge::Up) => {}
+            },
+        }
+    }
     bar.set_phase(BarPhase::Hidden);
 }
 

@@ -307,6 +307,7 @@ define_class!(
                 return;
             }
             if let Some(window) = self.window() {
+                self.keep_on_screen(&window);
                 save_origin(window.frame().origin);
             }
             self.apply_size(self.ivars().cur_w.get(), self.ivars().cur_h.get());
@@ -452,6 +453,28 @@ impl BarView {
             desired.x + (pill.0 - frame.size.width) / 2.0,
             desired.y + (pill.1 - frame.size.height) / 2.0,
         ));
+    }
+
+    /// A drop can leave the card partly below the screen, and a frame wholly
+    /// off screen has no `screen()`. Pull it back inside the display under
+    /// the pointer.
+    fn keep_on_screen(&self, window: &NSWindow) {
+        let Some(screen) =
+            screen_containing(self.mtm(), NSEvent::mouseLocation()).or_else(|| window.screen())
+        else {
+            return;
+        };
+        let visible = screen_rect(screen.visibleFrame());
+        let frame = window.frame();
+        let (x, y) = clamp_origin(
+            frame.origin.x,
+            frame.origin.y,
+            visible,
+            (frame.size.width, frame.size.height),
+        );
+        if (x - frame.origin.x).abs() >= 0.25 || (y - frame.origin.y).abs() >= 0.25 {
+            window.setFrameOrigin(NSPoint::new(x, y));
+        }
     }
 
     fn tick_dt(&self) -> f64 {
