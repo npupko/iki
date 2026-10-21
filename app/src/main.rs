@@ -197,25 +197,25 @@ fn key_file() -> PathBuf {
 /// Soniox rejects as "No audio received", so it ends the take silently.
 const MIN_HOLD: Duration = Duration::from_millis(250);
 
-/// Hold edges plus whether the key is down after the last one read.
+/// Hold edges plus whether a press arrived that no take has used yet.
 struct Keys {
     rx: UnboundedReceiver<HoldEdge>,
-    held: bool,
+    pressed: bool,
 }
 
 impl Keys {
     async fn recv(&mut self) -> Option<HoldEdge> {
         let edge = self.rx.recv().await?;
-        self.held = edge == HoldEdge::Down;
+        self.pressed = edge == HoldEdge::Down;
         Some(edge)
     }
 
     /// Drops the edges that queued while a take or notice was busy, keeping
-    /// only whether the key is still down. `false` once the tap is gone.
+    /// only whether the last of them was a press. `false` once the tap is gone.
     fn drain(&mut self) -> bool {
         loop {
             match self.rx.try_recv() {
-                Ok(edge) => self.held = edge == HoldEdge::Down,
+                Ok(edge) => self.pressed = edge == HoldEdge::Down,
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
             }
@@ -224,20 +224,23 @@ impl Keys {
 }
 
 async fn dictation_loop(rx: UnboundedReceiver<HoldEdge>, bar: BarController, api_key: String) {
-    let mut keys = Keys { rx, held: false };
+    let mut keys = Keys { rx, pressed: false };
     'hold: loop {
         // Presses made during the last take must not replay one by one.
         if !keys.drain() {
             return;
         }
-        if !keys.held {
+        if !keys.pressed {
             match keys.recv().await {
                 Some(HoldEdge::Down) => {}
                 Some(HoldEdge::Up) => continue,
                 None => return,
             }
         }
-        let pressed = Instant::now();
+        // This take uses the press. A hold that outlasts the take, or the
+        // notice it ends in, must not start another take by itself.
+        keys.pressed = false;
+        let mut pressed_at = Instant::now();
 
         if api_key.is_empty() {
             show_notice(&bar, missing_key_notice(), &mut keys).await;
@@ -258,8 +261,13 @@ async fn dictation_loop(rx: UnboundedReceiver<HoldEdge>, bar: BarController, api
             tokio::select! {
                 started = &mut start => break started,
                 edge = keys.recv() => match edge {
-                    Some(HoldEdge::Up) => held_for = Some(pressed.elapsed()),
-                    Some(HoldEdge::Down) => {}
+                    Some(HoldEdge::Up) => held_for = Some(pressed_at.elapsed()),
+                    // Pressed again while the mic opens: this take is the new hold.
+                    Some(HoldEdge::Down) => {
+                        keys.pressed = false;
+                        held_for = None;
+                        pressed_at = Instant::now();
+                    }
                     None => return,
                 },
             }
@@ -291,7 +299,7 @@ async fn dictation_loop(rx: UnboundedReceiver<HoldEdge>, bar: BarController, api
                     }
                     edge = keys.recv() => match edge {
                         Some(HoldEdge::Up) | None => {
-                            held_for = Some(pressed.elapsed());
+                            held_for = Some(pressed_at.elapsed());
                             break;
                         }
                         Some(HoldEdge::Down) => {}
@@ -442,7 +450,7 @@ async fn show_dictation_error(bar: &BarController, error: DictationError, keys: 
 }
 
 /// Shows the notice for four seconds. Pressing the key dismisses it and
-/// starts the next take, since `keys` then reports the key as held.
+/// starts the next take, since `keys` then reports a pending press.
 async fn show_notice(bar: &BarController, notice: Notice, keys: &mut Keys) {
     bar.set_phase(BarPhase::Error {
         title: notice.title,

@@ -306,11 +306,13 @@ define_class!(
             if self.ivars().drag.take().is_none() {
                 return;
             }
+            // The pill may have morphed while the drag held its frame still.
+            // Size it first, so the clamp and the saved origin see the final frame.
+            self.apply_size(self.ivars().cur_w.get(), self.ivars().cur_h.get());
             if let Some(window) = self.window() {
                 self.keep_on_screen(&window);
                 save_origin(window.frame().origin);
             }
-            self.apply_size(self.ivars().cur_w.get(), self.ivars().cur_h.get());
         }
 
         #[unsafe(method(tick:))]
@@ -455,13 +457,18 @@ impl BarView {
         ));
     }
 
-    /// A drop can leave the card partly below the screen, and a frame wholly
-    /// off screen has no `screen()`. Pull it back inside the display under
-    /// the pointer.
+    /// The screen to keep the pill inside: the one showing most of it, or,
+    /// for a frame dragged wholly off screen (which has no `screen()`), the
+    /// display under the pointer.
+    fn clamp_screen(&self, window: &NSWindow) -> Option<Retained<NSScreen>> {
+        window
+            .screen()
+            .or_else(|| screen_containing(self.mtm(), NSEvent::mouseLocation()))
+    }
+
+    /// A drop can leave the card partly off the screen. Pull it back inside.
     fn keep_on_screen(&self, window: &NSWindow) {
-        let Some(screen) =
-            screen_containing(self.mtm(), NSEvent::mouseLocation()).or_else(|| window.screen())
-        else {
+        let Some(screen) = self.clamp_screen(window) else {
             return;
         };
         let visible = screen_rect(screen.visibleFrame());
@@ -555,7 +562,7 @@ impl BarView {
         let mid_x = frame.origin.x + frame.size.width / 2.0;
         let mid_y = frame.origin.y + frame.size.height / 2.0;
         let mut origin = (mid_x - width / 2.0, mid_y - height / 2.0);
-        if let Some(screen) = window.screen() {
+        if let Some(screen) = self.clamp_screen(&window) {
             let visible = screen_rect(screen.visibleFrame());
             origin = clamp_origin(origin.0, origin.1, visible, (width, height));
         }
