@@ -228,12 +228,20 @@ fn configure_panel(panel: &BarPanel) {
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
     panel.setHasShadow(false);
-    panel.setLevel(NSStatusWindowLevel);
     panel.setHidesOnDeactivate(false);
     panel.setIgnoresMouseEvents(false);
     panel.setBecomesKeyOnlyIfNeeded(true);
     panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
-    panel.setCollectionBehavior(
+    float_over_everything(panel);
+}
+
+/// Puts the window above every app window, on every Space, including the
+/// Space of a full-screen app. macOS does not always attach a hidden
+/// all-Spaces window to a full-screen Space created while it was ordered out,
+/// so this is re-applied before each show rather than set once.
+fn float_over_everything(window: &NSWindow) {
+    window.setLevel(NSStatusWindowLevel);
+    window.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::Stationary
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
@@ -433,6 +441,7 @@ impl BarView {
         };
         if !self.ivars().shown.get() {
             self.move_to_focused_screen(&window);
+            float_over_everything(&window);
             window.orderFrontRegardless();
             self.ivars().shown.set(true);
         }
