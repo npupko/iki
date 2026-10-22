@@ -10,8 +10,8 @@ use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSBackingStoreType, NSBezelStyle,
     NSBezierPath, NSBorderType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
     NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont, NSLineBreakMode, NSMenu,
-    NSMenuItem, NSPopUpButton, NSResponder, NSScrollView, NSTextField, NSTextFieldDelegate,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSMenuItem, NSPopUpButton, NSResponder, NSScrollView, NSTextField, NSTextFieldDelegate, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSEdgeInsets, NSNotification, NSPoint, NSRect, NSSize, NSString};
 

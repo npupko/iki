@@ -11,16 +11,16 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use iki_bar::{BarPhase, BarController};
 use globe_input::{HoldEdge, HoldWatch};
+use iki_bar::{BarController, BarPhase};
 use objc2::msg_send;
 use objc2::sel;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
+    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSVariableStatusItemLength,
 };
-use objc2_foundation::NSString;
+use objc2_foundation::{NSSize, NSString};
 use soniox_audio::{DictationConfig, DictationError, DictationHandle};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -78,8 +78,18 @@ fn install_status_item(
 ) -> objc2::rc::Retained<objc2_app_kit::NSStatusItem> {
     let status = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = status.button(mtm) {
-        let title = NSString::from_str("Iki");
-        let _: () = unsafe { msg_send![&*button, setTitle: &*title] };
+        // `StatusIcon.png` and its @2x sit in the bundle's Resources. A bare
+        // `cargo run` has no bundle, so it falls back to the name.
+        if let Some(icon) = NSImage::imageNamed(&NSString::from_str("StatusIcon")) {
+            icon.setTemplate(true);
+            icon.setSize(NSSize::new(18.0, 18.0));
+            icon.setAccessibilityDescription(Some(&NSString::from_str("Iki")));
+            button.setImage(Some(&icon));
+        } else {
+            let title = NSString::from_str("Iki");
+            let _: () = unsafe { msg_send![&*button, setTitle: &*title] };
+        }
+        button.setToolTip(Some(&NSString::from_str("Iki")));
     }
 
     let menu = NSMenu::new(mtm);
@@ -435,7 +445,9 @@ fn notice_for_input(error: &globe_input::InputError) -> Notice {
 fn missing_key_notice() -> Notice {
     Notice {
         title: "Add your Soniox key".into(),
-        body: "Set SONIOX_API_KEY, or put the key in Iki's Application Support folder, then relaunch.".into(),
+        body:
+            "Set SONIOX_API_KEY, or put the key in Iki's Application Support folder, then relaunch."
+                .into(),
     }
 }
 

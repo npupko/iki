@@ -576,10 +576,7 @@ impl BarView {
             origin = clamp_origin(origin.0, origin.1, visible, (width, height));
         }
         window.setFrame_display(
-            NSRect::new(
-                NSPoint::new(origin.0, origin.1),
-                NSSize::new(width, height),
-            ),
+            NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height)),
             true,
         );
     }

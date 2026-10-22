@@ -705,18 +705,12 @@ mod tests {
         let mut store = Store::empty();
         store.entries.push(entry("teh", Some("the"), false, 1));
         store.entries.push(entry("Soniox", None, false, 9));
-        store
-            .entries
-            .push(entry("iki", Some("Iki"), true, 0));
+        store.entries.push(entry("iki", Some("Iki"), true, 0));
         store.entries.push(entry("Iki", None, false, 3));
         let terms = store.recognition_terms();
         assert_eq!(
             terms,
-            vec![
-                "Iki".to_string(),
-                "Soniox".to_string(),
-                "the".to_string()
-            ]
+            vec!["Iki".to_string(), "Soniox".to_string(), "the".to_string()]
         );
         assert!(!terms.iter().any(|term| term == "teh"));
     }
@@ -761,7 +755,9 @@ mod tests {
     fn a_correction_counts_its_spelling_too() {
         let mut store = Store::empty();
         store.entries.push(entry("teh", Some("the"), false, 0));
-        store.entries.push(entry("soniox", Some("Soniox"), false, 0));
+        store
+            .entries
+            .push(entry("soniox", Some("Soniox"), false, 0));
         assert!(store.note_uses("the cat and teh dog"));
         assert_eq!(store.entries[0].frequency_used, 2);
         assert!(store.note_uses("Soniox"));
@@ -777,8 +773,11 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dictionary.json");
-        fs::write(&path, br#"{"entries":[{"phrase":"Soniox","sort":"most_used"}],"sort":"most_used"}"#)
-            .unwrap();
+        fs::write(
+            &path,
+            br#"{"entries":[{"phrase":"Soniox","sort":"most_used"}],"sort":"most_used"}"#,
+        )
+        .unwrap();
         assert!(read_store(&path).entries.is_empty());
         assert!(path.exists(), "a plain read must not move the file");
         let store = read_store_for_write(&path);

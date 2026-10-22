@@ -361,17 +361,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iki-bar"
-version = "0.1.0"
-dependencies = [
- "core-foundation",
- "core-graphics",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
-]
-
-[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -475,21 +464,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iki"
-version = "0.1.0"
-dependencies = [
- "iki-bar",
- "globe-input",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "serde",
- "serde_json",
- "soniox-audio",
- "tokio",
-]
-
-[[package]]
 name = "globe-input"
 version = "0.1.0"
 dependencies = [
@@ -538,6 +512,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
+]
+
+[[package]]
+name = "iki"
+version = "0.1.0"
+dependencies = [
+ "globe-input",
+ "iki-bar",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "serde",
+ "serde_json",
+ "soniox-audio",
+ "tokio",
+]
+
+[[package]]
+name = "iki-bar"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "core-graphics",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
 ]
 
 [[package]]
