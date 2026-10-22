@@ -1,0 +1,24 @@
+[tasks.build]
+description = "Build and sign dist/Iki.app"
+run = "./scripts/bundle.sh"
+
+[tasks.install]
+description = "Build, copy Iki into /Applications and relaunch it"
+depends = ["build"]
+run = """
+pkill -x iki || true
+rm -rf /Applications/Iki.app
+cp -R dist/Iki.app /Applications/
+open /Applications/Iki.app
+"""
+
+[tasks.test]
+description = "Run the workspace tests"
+run = "cargo test --workspace"
+
+[tasks.icons]
+description = "Regenerate the icon, menu bar glyph and wordmarks"
+run = """
+swift scripts/make-icons.swift assets/brand/iki-mark-source.png 2E4A6B F0E8D5 assets/brand
+swift scripts/make-wordmark.swift assets/brand/iki-lockup-source.png A394C7 2E4A6B assets/brand
+"""
