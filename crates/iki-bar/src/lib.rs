@@ -25,9 +25,10 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBackingStoreType,
     NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSLineCapStyle, NSPanel, NSResponder, NSScreen, NSStatusWindowLevel, NSStringDrawing, NSView,
-    NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
-    NSWorkspace,
+    NSHapticFeedbackManager, NSHapticFeedbackPattern, NSHapticFeedbackPerformanceTime,
+    NSHapticFeedbackPerformer, NSLineCapStyle, NSPanel, NSResponder, NSScreen, NSStatusWindowLevel,
+    NSStringDrawing, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSDictionary, NSPoint, NSPointInRect, NSRect, NSRunLoop,
@@ -42,6 +43,8 @@ const WIDTH_PROCESSING: f64 = 98.0;
 const REST_W: f64 = 40.0;
 const REST_H: f64 = 8.0;
 const MARGIN: f64 = 8.0;
+/// A drag snaps the pill onto the screen's centre line within this distance.
+const SNAP_DISTANCE: f64 = 12.0;
 /// Notification card: min 340, max 440, padding 20, radius 24.
 const NOTICE_MIN_W: f64 = 340.0;
 const NOTICE_MAX_W: f64 = 440.0;
@@ -106,6 +109,7 @@ enum Mode {
 struct Drag {
     start_mouse: NSPoint,
     start_origin: NSPoint,
+    snapped: bool,
 }
 
 struct ViewIvars {
@@ -291,6 +295,7 @@ define_class!(
             self.ivars().drag.set(Some(Drag {
                 start_mouse: NSEvent::mouseLocation(),
                 start_origin: window.frame().origin,
+                snapped: false,
             }));
         }
 
@@ -303,10 +308,23 @@ define_class!(
                 return;
             };
             let now = NSEvent::mouseLocation();
-            window.setFrameOrigin(NSPoint::new(
+            let mut origin = NSPoint::new(
                 drag.start_origin.x + (now.x - drag.start_mouse.x),
                 drag.start_origin.y + (now.y - drag.start_mouse.y),
-            ));
+            );
+            let mut snapped = false;
+            if let Some(screen) = self.clamp_screen(&window) {
+                let visible = screen_rect(screen.visibleFrame());
+                (origin.x, snapped) = snap_to_center(origin.x, window.frame().size.width, visible);
+            }
+            if snapped && !drag.snapped {
+                NSHapticFeedbackManager::defaultPerformer().performFeedbackPattern_performanceTime(
+                    NSHapticFeedbackPattern::Alignment,
+                    NSHapticFeedbackPerformanceTime::Now,
+                );
+            }
+            self.ivars().drag.set(Some(Drag { snapped, ..drag }));
+            window.setFrameOrigin(origin);
         }
 
         #[unsafe(method(mouseUp:))]
@@ -319,7 +337,7 @@ define_class!(
             self.apply_size(self.ivars().cur_w.get(), self.ivars().cur_h.get());
             if let Some(window) = self.window() {
                 self.keep_on_screen(&window);
-                save_origin(window.frame().origin);
+                save_position(window.frame());
             }
         }
 
@@ -1204,14 +1222,15 @@ fn window_cg_rect(dict: CFDictionaryRef, key: CFStringRef) -> Option<CGRect> {
 }
 
 /// Bottom-left of a pill of `pill` size on `screen`.
-/// A saved drag is a fraction across its old visible frame and an inset from
-/// that frame's bottom, then clamped onto this screen.
+/// A saved drag is its centre's fraction across its old visible frame and an
+/// inset from that frame's bottom, then clamped onto this screen. Saving the
+/// centre keeps a centred pill centred as it changes width.
 fn origin_for_screen(mtm: MainThreadMarker, screen: &NSScreen, pill: (f64, f64)) -> NSPoint {
     let visible = screen_rect(screen.visibleFrame());
-    let point = if let Some(saved) = load_origin() {
+    let point = if let Some(saved) = load_position() {
         if let Some(home) = screen_containing(mtm, saved) {
             let from = screen_rect(home.visibleFrame());
-            map_origin((saved.x, saved.y), from, visible, pill)
+            map_position((saved.x, saved.y), from, visible, pill)
         } else {
             bottom_center(visible, pill)
         }
@@ -1283,14 +1302,36 @@ fn is_focus_window(owner: i64, pid: i64, layer: i64, alpha: f64, width: f64, hei
         && height.is_finite()
 }
 
-fn map_origin(saved: (f64, f64), from: ScreenRect, to: ScreenRect, pill: (f64, f64)) -> (f64, f64) {
+/// `saved` is the pill's bottom-centre point.
+fn map_position(
+    saved: (f64, f64),
+    from: ScreenRect,
+    to: ScreenRect,
+    pill: (f64, f64),
+) -> (f64, f64) {
     let frac_x = if from.width > 1.0 {
         (saved.0 - from.x) / from.width
     } else {
         0.5
     };
     let inset_y = saved.1 - from.y;
-    clamp_origin(to.x + frac_x * to.width, to.y + inset_y, to, pill)
+    clamp_origin(
+        to.x + frac_x * to.width - pill.0 / 2.0,
+        to.y + inset_y,
+        to,
+        pill,
+    )
+}
+
+/// Put the pill exactly on the visible frame's centre line when its centre
+/// is within `SNAP_DISTANCE` of it. Returns the origin x and whether it snapped.
+fn snap_to_center(x: f64, width: f64, visible: ScreenRect) -> (f64, bool) {
+    let center = visible.x + visible.width / 2.0;
+    if (x + width / 2.0 - center).abs() <= SNAP_DISTANCE {
+        (center - width / 2.0, true)
+    } else {
+        (x, false)
+    }
 }
 
 fn bottom_center(visible: ScreenRect, pill: (f64, f64)) -> (f64, f64) {
@@ -1330,22 +1371,27 @@ fn position_path() -> Option<PathBuf> {
     )
 }
 
-fn save_origin(origin: NSPoint) {
+/// Saves the bottom-centre point of `frame`.
+fn save_position(frame: NSRect) {
     let Some(path) = position_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let body = format!("{{\"x\":{:.4},\"y\":{:.4}}}\n", origin.x, origin.y);
+    let center_x = frame.origin.x + frame.size.width / 2.0;
+    let body = format!("{{\"cx\":{:.4},\"y\":{:.4}}}\n", center_x, frame.origin.y);
     let _ = fs::write(path, body);
 }
 
-fn load_origin() -> Option<NSPoint> {
+/// The saved bottom-centre point. A file from before centres were saved holds
+/// the recording pill's origin as `x`.
+fn load_position() -> Option<NSPoint> {
     let text = fs::read_to_string(position_path()?).ok()?;
-    let x = json_number(&text, "x")?;
+    let center_x = json_number(&text, "cx")
+        .or_else(|| json_number(&text, "x").map(|x| x + WIDTH_RECORDING / 2.0))?;
     let y = json_number(&text, "y")?;
-    Some(NSPoint::new(x, y))
+    Some(NSPoint::new(center_x, y))
 }
 
 fn json_number(text: &str, key: &str) -> Option<f64> {
@@ -1401,8 +1447,9 @@ fn parse_number(text: &str) -> Option<f64> {
 mod tests {
     use super::{
         audio_scale, bottom_center, cg_window_to_appkit, height_share, is_focus_window,
-        layout_notice, map_origin, screen_index_for_window, unit_bezier, voice_target, wave_mul,
-        ScreenRect, MARGIN, NOTICE_GAP, NOTICE_LINE, NOTICE_MAX_W, NOTICE_MIN_W, NOTICE_PAD,
+        layout_notice, map_position, screen_index_for_window, snap_to_center, unit_bezier,
+        voice_target, wave_mul, ScreenRect, MARGIN, NOTICE_GAP, NOTICE_LINE, NOTICE_MAX_W,
+        NOTICE_MIN_W, NOTICE_PAD,
     };
 
     fn chars(text: &str) -> f64 {
@@ -1563,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn dragged_origin_keeps_its_fraction_and_bottom_inset() {
+    fn dragged_centre_keeps_its_fraction_and_bottom_inset() {
         let from = ScreenRect {
             x: 0.0,
             y: 80.0,
@@ -1576,22 +1623,45 @@ mod tests {
             width: 1920.0,
             height: 1050.0,
         };
-        let (x, y) = map_origin((360.0, 120.0), from, to, (73.0, 30.0));
-        assert!((x - (1440.0 + 0.25 * 1920.0)).abs() < 1e-6, "{x}");
+        let (x, y) = map_position((360.0, 120.0), from, to, (73.0, 30.0));
+        assert!((x - (1440.0 + 0.25 * 1920.0 - 36.5)).abs() < 1e-6, "{x}");
         assert!((y - 40.0).abs() < 1e-6, "{y}");
     }
 
     #[test]
-    fn same_screen_mapping_is_the_saved_point() {
+    fn same_screen_mapping_centres_on_the_saved_point() {
         let frame = ScreenRect {
             x: 100.0,
             y: 40.0,
             width: 1400.0,
             height: 860.0,
         };
-        let (x, y) = map_origin((400.0, 48.0), frame, frame, (73.0, 30.0));
-        assert!((x - 400.0).abs() < 1e-6);
+        let (x, y) = map_position((400.0, 48.0), frame, frame, (73.0, 30.0));
+        assert!((x - (400.0 - 36.5)).abs() < 1e-6, "{x}");
         assert!((y - 48.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_centred_pill_stays_centred_at_any_width_and_screen() {
+        let from = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+        let to = ScreenRect {
+            x: 1440.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        for width in [40.0, 73.0, 98.0, 400.0] {
+            let (x, _) = map_position((720.0, 8.0), from, to, (width, 30.0));
+            assert!(
+                (x + width / 2.0 - (1440.0 + 960.0)).abs() < 1e-6,
+                "{width}: {x}"
+            );
+        }
     }
 
     #[test]
@@ -1608,9 +1678,24 @@ mod tests {
             width: 800.0,
             height: 500.0,
         };
-        let (x, y) = map_origin((2900.0, 1700.0), from, to, (73.0, 30.0));
+        let (x, y) = map_position((2900.0, 1700.0), from, to, (73.0, 30.0));
         assert!(x >= 0.0 && x + 73.0 <= 800.0 + 1e-6, "{x}");
         assert!(y >= 0.0 && y + 30.0 <= 500.0 + 1e-6, "{y}");
+    }
+
+    #[test]
+    fn a_drag_near_the_centre_line_snaps_onto_it() {
+        let visible = ScreenRect {
+            x: 100.0,
+            y: 0.0,
+            width: 1400.0,
+            height: 900.0,
+        };
+        // Centre line is x = 800; a 73 wide pill centres at origin 763.5.
+        assert_eq!(snap_to_center(763.5 + 12.0, 73.0, visible), (763.5, true));
+        assert_eq!(snap_to_center(763.5 - 9.0, 73.0, visible), (763.5, true));
+        assert_eq!(snap_to_center(763.5 + 12.5, 73.0, visible), (776.0, false));
+        assert_eq!(snap_to_center(300.0, 73.0, visible), (300.0, false));
     }
 
     #[test]
