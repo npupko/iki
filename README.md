@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/iki-wordmark-dark.png">
+    <img alt="Iki 息" src="assets/brand/iki-wordmark.png" width="280">
+  </picture>
+</p>
+
 # Iki
 
 Hold the Globe key (or fn) to dictate into the focused text field. Audio is transcribed with your Soniox key. Releasing the key pastes the transcript.

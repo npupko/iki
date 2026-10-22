@@ -711,7 +711,7 @@ fn paint_spinner(center: NSPoint, time: f64) {
         let alpha = 0.88 + (0.15 - 0.88) * t;
         let theta = index as f64 * std::f64::consts::FRAC_PI_4;
         let path = capsule(center.x, center.y, theta.sin(), theta.cos());
-        srgb(163.0 / 255.0, 148.0 / 255.0, 199.0 / 255.0, alpha).setFill();
+        srgb(124.0 / 255.0, 154.0 / 255.0, 192.0 / 255.0, alpha).setFill();
         path.fill();
     }
 }
