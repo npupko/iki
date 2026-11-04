@@ -283,7 +283,7 @@ pub(crate) fn config_json(terms: &[String], languages: &[String]) -> String {
     let terms = limit_terms(terms);
     let languages = limit_languages(languages);
     let mut value = serde_json::json!({
-        "model": "stt-rt-v5",
+        "model": "stt-rt-v6",
         "audio_format": "pcm_s16le",
         "sample_rate": 16000,
         "num_channels": 1,
@@ -353,7 +353,7 @@ mod tests {
     fn empty_terms_omit_context_and_keep_the_pcm_config() {
         let value: serde_json::Value =
             serde_json::from_str(&config_json(&[], &["en".into()])).unwrap();
-        assert_eq!(value["model"], "stt-rt-v5");
+        assert_eq!(value["model"], "stt-rt-v6");
         assert_eq!(value["audio_format"], "pcm_s16le");
         assert_eq!(value["sample_rate"], 16000);
         assert_eq!(value["num_channels"], 1);
