@@ -35,6 +35,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSRunningApplication",
     "NSScreen",
     "NSScrollView",
+    "NSSecureTextField",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
@@ -42,6 +43,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSTextField",
     "NSView",
     "NSWindow",
+    "NSWorkspace",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -54,7 +56,12 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSGeometry",
     "NSNotification",
     "NSString",
+    "NSURL",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+security-framework = "3"
+dispatch2 = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

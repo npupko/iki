@@ -1,9 +1,11 @@
 //! Hold the Globe key to dictate. Releasing it pastes the Soniox transcript.
 
+mod api_key;
 mod dashboard;
 mod dictionary;
 mod dictionary_ui;
 mod history;
+mod key_ui;
 mod languages;
 mod storage;
 
@@ -56,17 +58,18 @@ fn main() {
         }
     }
 
-    let api_key = load_api_key();
-    if api_key.is_empty() {
-        let notice = missing_key_notice();
-        bar.set_phase(BarPhase::Error {
-            title: notice.title,
-            body: notice.body,
-        });
+    // reqwest is built without its own crypto provider. Use the `ring` one
+    // the Soniox socket already selects, before any client is built.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    key_ui::set_runtime(runtime.handle().clone());
+
+    api_key::load();
+    if api_key::current().is_none() {
+        key_ui::show(mtm);
     }
 
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    runtime.spawn(dictation_loop(rx, bar, api_key));
+    runtime.spawn(dictation_loop(rx, bar));
 
     let _watch = watch.ok();
     app.run();
@@ -93,6 +96,7 @@ fn install_status_item(
     }
 
     let menu = NSMenu::new(mtm);
+    key_ui::add_menu_item(&menu, mtm);
     dictionary_ui::add_menu_item(&menu, mtm);
     dashboard::add_menu_item(&menu, mtm);
     let quit = unsafe {
@@ -140,69 +144,6 @@ fn install_edit_menu(app: &NSApplication, mtm: MainThreadMarker) {
     app.setMainMenu(Some(&main_menu));
 }
 
-fn load_api_key() -> String {
-    if let Ok(key) = std::env::var("SONIOX_API_KEY") {
-        let key = key.trim().to_string();
-        if !key.is_empty() {
-            return key;
-        }
-    }
-    let from_file = std::fs::read_to_string(key_file())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if !from_file.is_empty() {
-        return from_file;
-    }
-    fnox_key().unwrap_or_default()
-}
-
-/// `fnox get SONIOX_API_KEY`. Finder launches have a short PATH, so also try the mise shim.
-fn fnox_key() -> Option<String> {
-    let fnox = fnox_binary()?;
-    let output = Command::new(fnox)
-        .args(["get", "SONIOX_API_KEY", "--non-interactive"])
-        .env("FNOX_NON_INTERACTIVE", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let key = String::from_utf8(output.stdout).ok()?;
-    let key = key.trim().to_string();
-    if key.is_empty() {
-        None
-    } else {
-        Some(key)
-    }
-}
-
-fn fnox_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("fnox");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    let home = PathBuf::from(home);
-    [
-        home.join(".local/share/mise/shims/fnox"),
-        home.join(".local/share/mise/installs/fnox/latest/.mise-bins/fnox"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-}
-
-fn key_file() -> PathBuf {
-    storage::app_support_file("soniox_api_key")
-}
-
 /// A release sooner than this is a tap. It may have no audio at all, which
 /// Soniox rejects as "No audio received", so it ends the take silently.
 const MIN_HOLD: Duration = Duration::from_millis(250);
@@ -233,7 +174,7 @@ impl Keys {
     }
 }
 
-async fn dictation_loop(rx: UnboundedReceiver<HoldEdge>, bar: BarController, api_key: String) {
+async fn dictation_loop(rx: UnboundedReceiver<HoldEdge>, bar: BarController) {
     let mut keys = Keys { rx, pressed: false };
     'hold: loop {
         // Presses made during the last take must not replay one by one.
@@ -252,16 +193,16 @@ async fn dictation_loop(rx: UnboundedReceiver<HoldEdge>, bar: BarController, api
         keys.pressed = false;
         let mut pressed_at = Instant::now();
 
-        if api_key.is_empty() {
+        let Some(api_key) = api_key::current() else {
             show_notice(&bar, missing_key_notice(), &mut keys).await;
             continue;
-        }
+        };
 
         play_dictation("start");
         bar.set_phase(BarPhase::Recording { level: 0.0 });
 
         let start = DictationHandle::start(DictationConfig {
-            api_key: api_key.clone(),
+            api_key,
             terms: dictionary::recognition_terms(),
             languages: languages::codes(),
         });
@@ -421,7 +362,7 @@ fn is_auth_failure(detail: &str) -> bool {
 fn rejected_key_notice() -> Notice {
     Notice {
         title: "Soniox rejected the key".into(),
-        body: "Check SONIOX_API_KEY, or the key in Application Support, then relaunch.".into(),
+        body: "Update it in Soniox Key… in the Iki menu.".into(),
     }
 }
 
@@ -445,9 +386,7 @@ fn notice_for_input(error: &globe_input::InputError) -> Notice {
 fn missing_key_notice() -> Notice {
     Notice {
         title: "Add your Soniox key".into(),
-        body:
-            "Set SONIOX_API_KEY, or put the key in Iki's Application Support folder, then relaunch."
-                .into(),
+        body: "Open Soniox Key… in the Iki menu.".into(),
     }
 }
 
@@ -571,6 +510,15 @@ mod tests {
         .expect("shown");
         assert_eq!(notice.title, "Soniox rejected the key");
         assert!(!notice.body.to_ascii_lowercase().contains("authentication"));
+        assert!(notice.body.contains("Soniox Key…"));
+        assert!(!notice.body.contains("relaunch"));
+    }
+
+    #[test]
+    fn a_missing_key_points_at_the_menu_item() {
+        let notice = notice_for_dictation(&DictationError::MissingApiKey).expect("shown");
+        assert_eq!(notice.title, "Add your Soniox key");
+        assert_eq!(notice.body, "Open Soniox Key… in the Iki menu.");
     }
 
     #[test]

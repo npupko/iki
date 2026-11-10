@@ -271,7 +271,7 @@ fn entry_field(placeholder: &str, mtm: MainThreadMarker) -> Retained<NSTextField
     field
 }
 
-fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
+pub(crate) fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
     let field = NSTextField::labelWithString(&NSString::from_str(text), mtm);
     field.setTextColor(Some(&NSColor::secondaryLabelColor()));
     field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
@@ -294,7 +294,7 @@ fn popup(mtm: MainThreadMarker) -> Retained<NSPopUpButton> {
     popup
 }
 
-fn push_button(title: &str, frame: NSRect, mtm: MainThreadMarker) -> Retained<NSButton> {
+pub(crate) fn push_button(title: &str, frame: NSRect, mtm: MainThreadMarker) -> Retained<NSButton> {
     let button = NSButton::initWithFrame(NSButton::alloc(mtm), frame);
     button.setTitle(&NSString::from_str(title));
     button.setBezelStyle(NSBezelStyle::Push);
