@@ -2,3 +2,5 @@
 /dist/
 **/*.rs.bk
 .DS_Store
+
+/fnox.toml

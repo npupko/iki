@@ -26,6 +26,8 @@
 	<string>12.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Nick Pupko. MIT or Apache-2.0.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

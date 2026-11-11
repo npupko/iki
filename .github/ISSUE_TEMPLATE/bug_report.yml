@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in Iki does not work as described.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: iki
+    attributes:
+      label: Iki version
+      description: From the DMG name, such as 0.1.0, or "built from source" with the commit.
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 26.1
+    validations:
+      required: true
+  - type: dropdown
+    id: chip
+    attributes:
+      label: Mac
+      options:
+        - Apple silicon
+        - Intel
+    validations:
+      required: true
+  - type: textarea
+    id: notice
+    attributes:
+      label: Notice or error text
+      description: Paste any message Iki showed. Never paste your Soniox key.

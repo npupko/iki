@@ -22,6 +22,10 @@ else
     # Ad-hoc signatures do not: each build is a new identity.
     identity="${IKI_SIGN_ID:-Apple Development: lazynick7@gmail.com (PC7LYL8J8D)}"
     timestamp=(--timestamp=none)
+    if [[ -z "${IKI_SIGN_ID:-}" ]] && ! security find-identity -v -p codesigning | grep -qF "\"$identity\""; then
+        echo "No '$identity' in the Keychain. Signing ad hoc; set IKI_SIGN_ID to keep permission grants across rebuilds." >&2
+        identity=-
+    fi
 fi
 
 app="dist/Iki.app"
