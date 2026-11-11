@@ -21,12 +21,14 @@ The mark is the kanji **息** (*iki*, "breath") brushed in cream on an indigo ti
 | `StatusIcon.png`, `StatusIcon@2x.png` | menu bar template glyph, 18 and 36 px |
 | `iki-mark.png` | 1024 px square mark without rounding, for avatars and social |
 | `iki-wordmark.png`, `iki-wordmark-dark.png` | README wordmark on transparency, sumi and cream letters |
+| `../dmg/background.png`, `background@2x.png` | DMG installer window, drawn by `make-dmg-background.swift` |
 
 ## Regenerating
 
 ```sh
 swift scripts/make-icons.swift assets/brand/iki-mark-source.png 2E4A6B F0E8D5 assets/brand
 swift scripts/make-wordmark.swift assets/brand/iki-lockup-source.png A394C7 2E4A6B assets/brand
+swift scripts/make-dmg-background.swift assets/brand/iki-wordmark.png assets/dmg
 ```
 
 `make-icons.swift` splits each pixel of the mark into glyph coverage and paper grain, so any tile and glyph colour can be applied without regenerating the art. `make-wordmark.swift` unmixes the paper into alpha so letter edges carry the letter colour, not a paper halo.

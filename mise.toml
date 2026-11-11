@@ -1,3 +1,6 @@
+[tools]
+"pipx:dmgbuild" = "1.6.7"
+
 [tasks.build]
 description = "Build and sign dist/Iki.app"
 run = "./scripts/bundle.sh"
@@ -12,6 +15,17 @@ cp -R dist/Iki.app /Applications/
 open /Applications/Iki.app
 """
 
+[tasks.release]
+description = "Build a universal, notarized dist/Iki-<version>.dmg"
+run = "./scripts/release.sh"
+
+[tasks.publish]
+description = "Upload dist/Iki-<version>.dmg to a GitHub release tagged v<version>"
+run = """
+version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" app/Info.plist)
+gh release create "v$version" "dist/Iki-$version.dmg" --title "Iki $version" --generate-notes
+"""
+
 [tasks.test]
 description = "Run the workspace tests"
 run = "cargo test --workspace"
@@ -21,4 +35,5 @@ description = "Regenerate the icon, menu bar glyph and wordmarks"
 run = """
 swift scripts/make-icons.swift assets/brand/iki-mark-source.png 2E4A6B F0E8D5 assets/brand
 swift scripts/make-wordmark.swift assets/brand/iki-lockup-source.png A394C7 2E4A6B assets/brand
+swift scripts/make-dmg-background.swift assets/brand/iki-wordmark.png assets/dmg
 """
