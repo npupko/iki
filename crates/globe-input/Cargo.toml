@@ -9,4 +9,4 @@ publish = false
 [dependencies]
 arboard = "3"
 core-foundation = "0.10"
-core-graphics = { version = "0.24", features = ["link"] }
+core-graphics = { version = "0.25", features = ["link"] }
