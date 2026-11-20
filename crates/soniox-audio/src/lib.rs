@@ -11,6 +11,7 @@ mod session;
 mod state;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -19,6 +20,11 @@ use crate::audio::MicCapture;
 use crate::state::Shared;
 
 pub use crate::protocol::LiveTranscript;
+
+/// Upper bound on [`DictationHandle::finish`], from key-up. It covers a
+/// handshake still in flight, flushing queued audio, the end-of-stream frame,
+/// waiting for `finished`, and any send blocked on a dead socket.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 pub struct DictationConfig {
@@ -69,7 +75,16 @@ impl DictationHandle {
         let languages = config.languages;
         let session_shared = Arc::clone(&shared);
         let session = tokio::spawn(async move {
-            session::run_session(api_key, terms, languages, session_shared, ready_tx, end_rx).await
+            session::run_session(
+                session::SONIOX_URL,
+                api_key,
+                terms,
+                languages,
+                session_shared,
+                ready_tx,
+                end_rx,
+            )
+            .await
         });
 
         Ok(Self {
@@ -118,30 +133,34 @@ impl DictationHandle {
         self.shared.transcript()
     }
 
-    /// Stops the mic, ends the Soniox stream, waits for the finished response (timeout 8s),
+    /// Stops the mic, ends the Soniox stream, waits for the finished response,
     /// and returns the trimmed full transcript (`committed + partial`).
+    /// Never waits longer than [`FINISH_TIMEOUT`]. On a timeout it returns the
+    /// text transcribed so far, or a network error when there is none.
     pub async fn finish(mut self) -> Result<String, DictationError> {
         self.mic.stop();
         if let Some(end_tx) = self.end_tx.take() {
             let _ = end_tx.send(());
         }
-        let mut guard = TaskGuard {
-            task: self.session.take(),
-            disarm: false,
-        };
-        let result = if let Some(task) = guard.task.as_mut() {
-            match task.await {
-                Ok(result) => result,
-                Err(error) if error.is_cancelled() => Err(DictationError::Cancelled),
-                Err(error) => Err(DictationError::Network(format!(
+        // Aborts the session on a timeout, or if this future is dropped.
+        let mut guard = TaskGuard(self.session.take());
+        if let Some(task) = guard.0.as_mut() {
+            match tokio::time::timeout(FINISH_TIMEOUT, task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) if error.is_cancelled() => Err(DictationError::Cancelled),
+                Ok(Err(error)) => Err(DictationError::Network(format!(
                     "session task failed: {error}"
                 ))),
+                Err(_elapsed) => session::finish_result(
+                    Err(DictationError::Network(
+                        "timed out waiting for Soniox".to_string(),
+                    )),
+                    &self.shared,
+                ),
             }
         } else {
             Ok(self.shared.render())
-        };
-        guard.disarm = true;
-        result
+        }
     }
 }
 
@@ -155,17 +174,12 @@ impl Drop for DictationHandle {
     }
 }
 
-struct TaskGuard {
-    task: Option<JoinHandle<Result<String, DictationError>>>,
-    disarm: bool,
-}
+/// Aborting a task that already finished does nothing.
+struct TaskGuard(Option<JoinHandle<Result<String, DictationError>>>);
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        if self.disarm {
-            return;
-        }
-        if let Some(task) = self.task.take() {
+        if let Some(task) = self.0.take() {
             task.abort();
         }
     }

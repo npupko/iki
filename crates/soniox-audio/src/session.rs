@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, MissedTickBehavior};
@@ -16,8 +17,13 @@ use crate::protocol::{ingest_message, Ingest};
 use crate::state::Shared;
 use crate::DictationError;
 
-const SONIOX_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
-const FINISH_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const SONIOX_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
+/// Bounds the handshake plus the config frame. It stays under the ten seconds
+/// of audio the mic queue holds, so nothing recorded meanwhile is dropped.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// A handshake that fails on the transport (or with a 5xx) is tried once more
+/// after this pause, inside [`CONNECT_TIMEOUT`].
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(300);
 /// Soniox rejects a `context` object over 8,000 tokens, which the docs
 /// approximate as 10,000 characters, and then closes the socket. Stay under
 /// that approximation so a long dictionary cannot fail the handshake.
@@ -26,7 +32,10 @@ const CONTEXT_CHAR_BUDGET: usize = 9_000;
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Runs until Soniox finishes. The time after key-up is bounded by the
+/// caller, in [`crate::DictationHandle::finish`].
 pub(crate) async fn run_session(
+    url: &str,
     api_key: String,
     terms: Vec<String>,
     languages: Vec<String>,
@@ -36,21 +45,21 @@ pub(crate) async fn run_session(
 ) -> Result<String, DictationError> {
     // A key-up during connect must not discard the samples already queued.
     // Finish the handshake, then the loop below sees `end_rx` and flushes.
-    let socket = match connect_soniox(&api_key).await {
-        Ok(socket) => socket,
+    let config = config_json(&terms, &languages);
+    let opened = timeout(CONNECT_TIMEOUT, open_stream(url, &api_key, config))
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(DictationError::Network(
+                "timed out connecting to Soniox".to_string(),
+            ))
+        });
+    let (mut write, mut read) = match opened {
+        Ok(halves) => halves,
         Err(error) => {
             let _ = ready_tx.send(Err(error.clone()));
             return Err(error);
         }
     };
-
-    let (mut write, mut read) = socket.split();
-    let config = config_json(&terms, &languages);
-    if let Err(error) = write.send(Message::text(config)).await {
-        let error = network(&error, &api_key);
-        let _ = ready_tx.send(Err(error.clone()));
-        return Err(error);
-    }
     let _ = ready_tx.send(Ok(()));
 
     let mut pace = tokio::time::interval(Duration::from_millis(20));
@@ -82,20 +91,12 @@ pub(crate) async fn run_session(
     if let Err(error) = write.send(Message::text("")).await {
         return Err(network(&error, &api_key));
     }
-
-    let waited = timeout(
-        FINISH_TIMEOUT,
-        wait_until_finished(&mut write, &mut read, &shared, &api_key),
-    )
-    .await;
-    let result = match waited {
-        Ok(result) => result,
-        Err(_elapsed) => Ok(shared.render()),
-    };
+    let result = wait_until_finished(&mut write, &mut read, &shared, &api_key).await;
     finish_result(result, &shared)
 }
 
-fn finish_result(
+/// Keeps whatever was transcribed when the network fails or times out.
+pub(crate) fn finish_result(
     result: Result<String, DictationError>,
     shared: &Shared,
 ) -> Result<String, DictationError> {
@@ -239,10 +240,39 @@ where
     Ok(())
 }
 
-async fn connect_soniox(api_key: &str) -> Result<Socket, DictationError> {
+async fn open_stream(
+    url: &str,
+    api_key: &str,
+    config: String,
+) -> Result<(SplitSink<Socket, Message>, SplitStream<Socket>), DictationError> {
+    let socket = connect_with_retry(url, api_key).await?;
+    let (mut write, read) = socket.split();
+    write
+        .send(Message::text(config))
+        .await
+        .map_err(|error| network(&error, api_key))?;
+    Ok((write, read))
+}
+
+async fn connect_with_retry(url: &str, api_key: &str) -> Result<Socket, DictationError> {
     // rustls 0.23 will not negotiate TLS until a process provider is installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut request = SONIOX_URL
+    match connect_async(soniox_request(url, api_key)?).await {
+        Ok((socket, _response)) => return Ok(socket),
+        Err(error) if is_transient(&error) => tokio::time::sleep(CONNECT_RETRY_DELAY).await,
+        Err(error) => return Err(network(&error, api_key)),
+    }
+    connect_async(soniox_request(url, api_key)?)
+        .await
+        .map(|(socket, _response)| socket)
+        .map_err(|error| network(&error, api_key))
+}
+
+fn soniox_request(
+    url: &str,
+    api_key: &str,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, DictationError> {
+    let mut request = url
         .into_client_request()
         .map_err(|error| network(&error, api_key))?;
     let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
@@ -252,9 +282,16 @@ async fn connect_soniox(api_key: &str) -> Result<Socket, DictationError> {
     request
         .headers_mut()
         .insert(HeaderName::from_static("authorization"), authorization);
-    match connect_async(request).await {
-        Ok((socket, _response)) => Ok(socket),
-        Err(error) => Err(network(&error, api_key)),
+    Ok(request)
+}
+
+/// Transport failures and server-side 5xx are worth one more try. A 4xx
+/// (such as a rejected key) or a bad URL fails the same way every time.
+fn is_transient(error: &WsError) -> bool {
+    match error {
+        WsError::Io(_) | WsError::Tls(_) => true,
+        WsError::Http(response) => response.status().is_server_error(),
+        _ => false,
     }
 }
 
@@ -347,7 +384,81 @@ fn redact(message: &str, api_key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_json, context_object_len, limit_terms, CONTEXT_CHAR_BUDGET};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::http::Response;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    use super::{
+        config_json, context_object_len, is_transient, limit_terms, run_session,
+        CONNECT_RETRY_DELAY, CONTEXT_CHAR_BUDGET,
+    };
+    use crate::state::Shared;
+    use crate::DictationError;
+
+    /// The network error messages from the ready channel and the session result.
+    async fn session_errors(url: &str) -> [String; 2] {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (_end_tx, end_rx) = oneshot::channel();
+        let result = run_session(
+            url,
+            "key".into(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(Shared::new()),
+            ready_tx,
+            end_rx,
+        )
+        .await;
+        let ready = ready_rx.await.expect("ready is always sent");
+        [ready.unwrap_err(), result.unwrap_err()].map(|error| match error {
+            DictationError::Network(message) => message,
+            other => panic!("expected a network error, got {other:?}"),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_that_never_answers_times_out() {
+        // Bound but never accepted: the TCP connect lands in the backlog and
+        // the HTTP upgrade response never comes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        for message in session_errors(&url).await {
+            assert!(message.contains("timed out"));
+        }
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_tried_twice_then_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let started = Instant::now();
+        let messages = session_errors(&url).await;
+        assert!(started.elapsed() >= CONNECT_RETRY_DELAY);
+        for message in messages {
+            assert!(!message.contains("timed out"));
+        }
+    }
+
+    #[test]
+    fn only_transport_failures_and_5xx_are_retried() {
+        let http = |status: u16| {
+            WsError::Http(Box::new(
+                Response::builder().status(status).body(None).unwrap(),
+            ))
+        };
+        assert!(!is_transient(&http(401)));
+        assert!(!is_transient(&http(403)));
+        assert!(is_transient(&http(503)));
+        assert!(is_transient(&WsError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        ))));
+        assert!(!is_transient(&WsError::ConnectionClosed));
+    }
 
     #[test]
     fn empty_terms_omit_context_and_keep_the_pcm_config() {
